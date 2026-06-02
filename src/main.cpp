@@ -8,7 +8,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include "gguf_parser.cpp"
+#include "gguf_parser.hpp"
 
 class MappedFile {
     private:
