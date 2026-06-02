@@ -8,6 +8,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "gguf_parser.cpp"
 
 class MappedFile {
     private:
@@ -81,23 +82,11 @@ int main(int argc, char** argv) {
     MappedFile model(argv[1]);
     const uint8_t* base = static_cast<const uint8_t*>(model.data());
 
-    if (model.size() < 24) {
-        throw std::runtime_error("file too small for GGUF header");
-    }
-
-    if (std::memcmp(base, "GGUF", 4) != 0) {
-        throw std::runtime_error("not a GGUF file (bad magic)");
-    }
-
-    uint32_t version = 0;
-    uint64_t n_tensors = 0;
-    uint64_t n_kv = 0;
-    std::memcpy(&version,   base + 4,  sizeof(version));    // offset 4
-    std::memcpy(&n_tensors, base + 8,  sizeof(n_tensors));  // offset 8
-    std::memcpy(&n_kv,      base + 16, sizeof(n_kv));       // offset 16
-    std::cout << "version: "   << version   << "\n";
-    std::cout << "n_tensors: " << n_tensors << "\n";
-    std::cout << "n_kv: "      << n_kv      << "\n";
-    
+    GgufParser parser(base, model.size());
+    std::cout << "arch: "             << parser.arch             << "\n";
+    std::cout << "block_count: "      << parser.block_count      << "\n";
+    std::cout << "embedding_length: " << parser.embedding_length << "\n";
+    std::cout << "tensors: "          << parser.tensors.size()   << "\n";
+    std::cout << "offset: " << parser.tensor_data_offset;    
     return 0;
 }
