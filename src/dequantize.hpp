@@ -10,6 +10,7 @@ struct block_q4_K {
     uint8_t sub_scales[12];
     uint8_t nibbles[128];
 };
+static_assert(sizeof(block_q4_K) == 144, "block_q4_K size mismatch — check struct padding");
 
 static inline float fp16_to_fp32(uint16_t float16_bits) {
     uint32_t sign = (float16_bits >> 15) & 1;
@@ -18,7 +19,13 @@ static inline float fp16_to_fp32(uint16_t float16_bits) {
     uint32_t float32_bits;
 
     if (exponent == 0) {
-        float32_bits = (sign << 31) | (mantissa << 13);
+        if (mantissa == 0) {
+            float32_bits = (sign << 31);
+        } else {
+            uint32_t p = 0, tmp = mantissa;
+            while (tmp >>= 1) ++p;
+            float32_bits = (sign << 31) | ((p + 103) << 23) | ((mantissa - (1u << p)) << (23u - p));
+        }
     } 
     else if (exponent == 31) {
         float32_bits = (sign << 31) | (0xFF << 23) | (mantissa << 13);

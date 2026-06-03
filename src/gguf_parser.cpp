@@ -27,6 +27,14 @@ uint64_t GgufParser::read_u64() {
     return v;
 }
 
+float GgufParser::read_f32() {
+    if (read_position_ + 4 > size_) throw std::runtime_error("truncated (f32)");
+    float v = 0;
+    std::memcpy(&v, base_ + read_position_, 4);
+    read_position_ += 4;
+    return v;
+}
+
 std::string GgufParser::read_str() {
     uint64_t len = read_u64();
     if (read_position_ + len > size_) throw std::runtime_error("truncated (string)");
@@ -106,8 +114,28 @@ void GgufParser::parse_kv(uint64_t n_kv) {
             else if (vtype == 10) embedding_length = read_u64();
             else skip_value(vtype);
         }
+        else if (key == "tokenizer.ggml.tokens" && vtype == 9) {
+            read_u32();
+            uint64_t count = read_u64();
+            vocab_tokens.reserve(count);
+            for (uint64_t i = 0; i < count; ++i)
+                vocab_tokens.push_back(read_str());
+        }
+        else if (key == "tokenizer.ggml.scores" && vtype == 9) {
+            read_u32();
+            uint64_t count = read_u64();
+            vocab_scores.resize(count);
+            for (uint64_t i = 0; i < count; ++i)
+                vocab_scores[i] = read_f32();
+        }
+        else if (key == "tokenizer.ggml.bos_token_id" && vtype == 4) {
+            bos_token_id = read_u32();
+        }
+        else if (key == "tokenizer.ggml.eos_token_id" && vtype == 4) {
+            eos_token_id = read_u32();
+        }
         else {
-            skip_value(vtype);  
+            skip_value(vtype);
         }
     }
 }

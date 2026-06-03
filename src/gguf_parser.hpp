@@ -1,6 +1,7 @@
 #pragma once
 #include <unordered_map>
 #include <string>
+#include <vector>
 #include <cstdint>
 
 struct TensorInfo {
@@ -19,6 +20,7 @@ class GgufParser {
 
         uint32_t read_u32();
         uint64_t read_u64();
+        float    read_f32();
         std::string read_str();
         void skip_value(uint32_t vtype);
 
@@ -33,6 +35,11 @@ class GgufParser {
         uint64_t n_tensors = 0;
         uint64_t tensor_data_offset = 0;
         std::unordered_map<std::string, TensorInfo> tensors;
+
+        std::vector<std::string> vocab_tokens;
+        std::vector<float>       vocab_scores;
+        uint32_t bos_token_id = 1;
+        uint32_t eos_token_id = 2;
 
         explicit GgufParser(const uint8_t* base, size_t file_size);
 };

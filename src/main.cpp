@@ -3,12 +3,14 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include "gguf_parser.hpp"
+#include "tokenizer.hpp"
 
 class MappedFile {
     private:
@@ -87,6 +89,21 @@ int main(int argc, char** argv) {
     std::cout << "block_count: "      << parser.block_count      << "\n";
     std::cout << "embedding_length: " << parser.embedding_length << "\n";
     std::cout << "tensors: "          << parser.tensors.size()   << "\n";
-    std::cout << "offset: " << parser.tensor_data_offset;    
+    std::cout << "tensor_data_offset: " << parser.tensor_data_offset << "\n";
+
+    std::cout << "vocab size: " << parser.vocab_tokens.size() << "\n";
+
+    Tokenizer tokenizer(parser.vocab_tokens, parser.vocab_scores,
+                        parser.bos_token_id, parser.eos_token_id);
+
+    std::string prompt = (argc >= 3) ? argv[2] : "Hello";
+    std::vector<int> token_ids = tokenizer.encode(prompt);
+
+    std::cout << "prompt: \"" << prompt << "\"\n";
+    std::cout << "tokens:";
+    for (int id : token_ids)
+        std::cout << " " << id << "(\"" << tokenizer.vocab[id] << "\")";
+    std::cout << "\n";
+    std::cout << "decoded: \"" << tokenizer.decode(token_ids) << "\"\n";
     return 0;
 }
