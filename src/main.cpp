@@ -9,6 +9,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "dequantize.hpp"
+#include "forward_pass.hpp"
 #include "gguf_parser.hpp"
 #include "tokenizer.hpp"
 
@@ -105,5 +107,21 @@ int main(int argc, char** argv) {
         std::cout << " " << id << "(\"" << tokenizer.vocab[id] << "\")";
     std::cout << "\n";
     std::cout << "decoded: \"" << tokenizer.decode(token_ids) << "\"\n";
+
+    auto& embd_tensor = parser.tensors.at("token_embd.weight");
+    const uint8_t* embd_bytes = base + parser.tensor_data_offset + embd_tensor.offset;
+    int64_t embd_dim   = embd_tensor.dims[0];
+    int64_t vocab_size = embd_tensor.dims[1];
+    std::vector<float> embd_table(embd_dim * vocab_size);
+    dequantize_q4_K(embd_bytes, embd_table.data(), embd_dim * vocab_size);
+
+    std::vector<float> input = embed_tokens(token_ids, embd_table, embd_dim);
+
+    std::cout << "input shape: " << token_ids.size() << " x " << embd_dim << "\n";
+    std::cout << "input[0][0..3]:";
+    for (int i = 0; i < 4; ++i)
+        std::cout << " " << input[i];
+    std::cout << "\n";
+
     return 0;
 }

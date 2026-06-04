@@ -38,7 +38,7 @@ static std::string preprocess(const std::string& text) {
 
 static std::vector<Symbol> initial_symbols(
     const std::string& text,
-    const std::unordered_map<std::string, int>& token_to_id)
+    const std::unordered_map<std::string, int> &token_to_id)
 {
     std::vector<Symbol> syms;
     for (size_t i = 0; i < text.size(); ) {
