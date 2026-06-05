@@ -118,7 +118,14 @@ int main(int argc, char** argv) {
     std::vector<float> input = embed_tokens(token_ids, embd_table, embd_dim);
 
     std::cout << "input shape: " << token_ids.size() << " x " << embd_dim << "\n";
-    std::cout << "input[0][0..3]:";
+
+    auto& norm_tensor = parser.tensors.at("blk.0.attn_norm.weight");
+    const float* norm_weight = reinterpret_cast<const float*>(
+        base + parser.tensor_data_offset + norm_tensor.offset);
+
+    rms_norm(input.data(), norm_weight, embd_dim);
+
+    std::cout << "after rms_norm, input[0][0..3]:";
     for (int i = 0; i < 4; ++i)
         std::cout << " " << input[i];
     std::cout << "\n";
