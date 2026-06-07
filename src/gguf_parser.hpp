@@ -32,6 +32,8 @@ class GgufParser {
         std::string arch;
         uint64_t block_count = 0;
         uint64_t embedding_length = 0;
+        uint64_t head_count = 0;
+        uint64_t head_count_kv = 0;
         uint64_t n_tensors = 0;
         uint64_t tensor_data_offset = 0;
         std::unordered_map<std::string, TensorInfo> tensors;

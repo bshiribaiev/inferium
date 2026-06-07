@@ -125,10 +125,27 @@ int main(int argc, char** argv) {
 
     rms_norm(input.data(), norm_weight, embd_dim);
 
-    std::cout << "after rms_norm, input[0][0..3]:";
-    for (int i = 0; i < 4; ++i)
-        std::cout << " " << input[i];
-    std::cout << "\n";
+    auto& q_tensor = parser.tensors.at("blk.0.attn_q.weight");
+    auto& k_tensor = parser.tensors.at("blk.0.attn_k.weight");
+    auto& v_tensor = parser.tensors.at("blk.0.attn_v.weight");
+
+    int64_t q_dim = q_tensor.dims[1];
+    int64_t k_dim = k_tensor.dims[1];
+    int64_t v_dim = v_tensor.dims[1];
+
+    std::vector<float> W_Q(embd_dim * q_dim), W_K(embd_dim * k_dim), W_V(embd_dim * v_dim);
+    dequantize_q4_K(base + parser.tensor_data_offset + q_tensor.offset, W_Q.data(), embd_dim * q_dim);
+    dequantize_q4_K(base + parser.tensor_data_offset + k_tensor.offset, W_K.data(), embd_dim * k_dim);
+    dequantize_q4_K(base + parser.tensor_data_offset + v_tensor.offset, W_V.data(), embd_dim * v_dim);
+
+    std::vector<float> q(q_dim), k(k_dim), v(v_dim);
+    mat_vec(W_Q.data(), input.data(), q.data(), q_dim, embd_dim);
+    mat_vec(W_K.data(), input.data(), k.data(), k_dim, embd_dim);
+    mat_vec(W_V.data(), input.data(), v.data(), v_dim, embd_dim);
+
+    std::cout << "q shape: " << q_dim << ", k shape: " << k_dim << "\n";
+    std::cout << "q[0..3]:"; for (int i = 0; i < 4; ++i) std::cout << " " << q[i]; std::cout << "\n";
+    std::cout << "k[0..3]:"; for (int i = 0; i < 4; ++i) std::cout << " " << k[i]; std::cout << "\n";
 
     return 0;
 }

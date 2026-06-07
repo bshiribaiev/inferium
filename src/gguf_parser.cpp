@@ -114,6 +114,16 @@ void GgufParser::parse_kv(uint64_t n_kv) {
             else if (vtype == 10) embedding_length = read_u64();
             else skip_value(vtype);
         }
+        else if (key == "llama.attention.head_count") {
+            if (vtype == 4)  head_count = read_u32();
+            else if (vtype == 10) head_count = read_u64();
+            else skip_value(vtype);
+        }
+        else if (key == "llama.attention.head_count_kv") {
+            if (vtype == 4)  head_count_kv = read_u32();
+            else if (vtype == 10) head_count_kv = read_u64();
+            else skip_value(vtype);
+        }
         else if (key == "tokenizer.ggml.tokens" && vtype == 9) {
             read_u32();
             uint64_t count = read_u64();

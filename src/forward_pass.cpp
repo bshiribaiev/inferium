@@ -25,3 +25,14 @@ void rms_norm(float* x, const float* weight, int n, float eps)
     for (int i = 0; i < n; ++i)
         x[i] = x[i] * scale * weight[i];
 }
+
+void mat_vec(const float* W, const float* x, float* out, int out_dim, int in_dim)
+{
+    for (int i = 0; i < out_dim; ++i) {
+        float sum = 0.0f;
+        const float* row = W + i * in_dim;
+        for (int j = 0; j < in_dim; ++j)
+            sum += row[j] * x[j];
+        out[i] = sum;
+    }
+}
