@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <numeric>
 
 std::vector<float> embed_tokens(
     const std::vector<int>& token_ids,
@@ -50,6 +51,51 @@ void rope(float* x, int pos, int n_heads, int head_dim, float theta_base)
             float v1 = head[2 * i + 1];
             head[2 * i]     = v0 * cos_t - v1 * sin_t;
             head[2 * i + 1] = v0 * sin_t + v1 * cos_t;
+        }
+    }
+}
+
+static void softmax(float* x, int n)
+{
+    float max_val = *std::max_element(x, x + n);
+    float sum = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        x[i] = std::exp(x[i] - max_val);
+        sum += x[i];
+    }
+    for (int i = 0; i < n; ++i)
+        x[i] /= sum;
+}
+
+void attention(
+    const float* Q, const float* K, const float* V, float* out,
+    int seq_len, int n_heads, int n_kv_heads, int head_dim)
+{
+    int kv_group  = n_heads / n_kv_heads;
+    int q_stride  = n_heads    * head_dim;
+    int kv_stride = n_kv_heads * head_dim;
+    std::vector<float> scores(seq_len);
+
+    for (int h = 0; h < n_heads; ++h) {
+        int h_kv = h / kv_group;
+        for (int i = 0; i < seq_len; ++i) {
+            const float* q = Q + i * q_stride  + h    * head_dim;
+            for (int j = 0; j <= i; ++j) {
+                const float* k = K + j * kv_stride + h_kv * head_dim;
+                float dot = 0.0f;
+                for (int d = 0; d < head_dim; ++d)
+                    dot += q[d] * k[d];
+                scores[j] = dot / std::sqrt((float)head_dim);
+            }
+            softmax(scores.data(), i + 1);
+
+            float* o = out + i * q_stride + h * head_dim;
+            std::fill(o, o + head_dim, 0.0f);
+            for (int j = 0; j <= i; ++j) {
+                const float* v = V + j * kv_stride + h_kv * head_dim;
+                for (int d = 0; d < head_dim; ++d)
+                    o[d] += scores[j] * v[d];
+            }
         }
     }
 }

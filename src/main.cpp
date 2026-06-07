@@ -113,7 +113,7 @@ int main(int argc, char** argv) {
     int64_t embd_dim   = embd_tensor.dims[0];
     int64_t vocab_size = embd_tensor.dims[1];
     std::vector<float> embd_table(embd_dim * vocab_size);
-    dequantize_q4_K(embd_bytes, embd_table.data(), embd_dim * vocab_size);
+    dequantize(embd_tensor.dtype, embd_bytes, embd_table.data(), embd_dim * vocab_size);
 
     std::vector<float> input = embed_tokens(token_ids, embd_table, embd_dim);
 
@@ -132,10 +132,14 @@ int main(int argc, char** argv) {
     int64_t k_dim = k_tensor.dims[1];
     int64_t v_dim = v_tensor.dims[1];
 
+    std::cout << "attn_q dtype: " << q_tensor.dtype
+              << " attn_k dtype: " << k_tensor.dtype
+              << " attn_v dtype: " << v_tensor.dtype << "\n";
+
     std::vector<float> W_Q(embd_dim * q_dim), W_K(embd_dim * k_dim), W_V(embd_dim * v_dim);
-    dequantize_q4_K(base + parser.tensor_data_offset + q_tensor.offset, W_Q.data(), embd_dim * q_dim);
-    dequantize_q4_K(base + parser.tensor_data_offset + k_tensor.offset, W_K.data(), embd_dim * k_dim);
-    dequantize_q4_K(base + parser.tensor_data_offset + v_tensor.offset, W_V.data(), embd_dim * v_dim);
+    dequantize(q_tensor.dtype, base + parser.tensor_data_offset + q_tensor.offset, W_Q.data(), embd_dim * q_dim);
+    dequantize(k_tensor.dtype, base + parser.tensor_data_offset + k_tensor.offset, W_K.data(), embd_dim * k_dim);
+    dequantize(v_tensor.dtype, base + parser.tensor_data_offset + v_tensor.offset, W_V.data(), embd_dim * v_dim);
 
     std::vector<float> Q(seq_len * q_dim), K(seq_len * k_dim), V(seq_len * v_dim);
 
@@ -149,8 +153,14 @@ int main(int argc, char** argv) {
         rope(K.data() + t * k_dim, t, parser.head_count_kv, head_dim);
     }
 
-    std::cout << "Q[1][0..3]:"; for (int i = 0; i < 4; ++i) std::cout << " " << Q[q_dim + i]; std::cout << "\n";
-    std::cout << "K[1][0..3]:"; for (int i = 0; i < 4; ++i) std::cout << " " << K[k_dim + i]; std::cout << "\n";
+    std::vector<float> attn_out(seq_len * q_dim);
+    attention(Q.data(), K.data(), V.data(), attn_out.data(),
+              seq_len, parser.head_count, parser.head_count_kv, head_dim);
+
+    std::cout << "attn_out[1][0..3]:";
+    for (int i = 0; i < 4; ++i)
+        std::cout << " " << attn_out[q_dim + i];
+    std::cout << "\n";
 
     return 0;
 }
