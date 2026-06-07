@@ -1,6 +1,7 @@
 #include "forward_pass.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 
 std::vector<float> embed_tokens(
     const std::vector<int>& token_ids,
@@ -34,5 +35,21 @@ void mat_vec(const float* W, const float* x, float* out, int out_dim, int in_dim
         for (int j = 0; j < in_dim; ++j)
             sum += row[j] * x[j];
         out[i] = sum;
+    }
+}
+
+void rope(float* x, int pos, int n_heads, int head_dim, float theta_base)
+{
+    for (int h = 0; h < n_heads; ++h) {
+        float* head = x + h * head_dim;
+        for (int i = 0; i < head_dim / 2; ++i) {
+            float theta = pos / std::pow(theta_base, 2.0f * i / head_dim);
+            float cos_t = std::cos(theta);
+            float sin_t = std::sin(theta);
+            float v0 = head[2 * i];
+            float v1 = head[2 * i + 1];
+            head[2 * i]     = v0 * cos_t - v1 * sin_t;
+            head[2 * i + 1] = v0 * sin_t + v1 * cos_t;
+        }
     }
 }

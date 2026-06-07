@@ -117,13 +117,12 @@ int main(int argc, char** argv) {
 
     std::vector<float> input = embed_tokens(token_ids, embd_table, embd_dim);
 
-    std::cout << "input shape: " << token_ids.size() << " x " << embd_dim << "\n";
+    int seq_len  = (int)token_ids.size();
+    int head_dim = embd_dim / (int)parser.head_count;
 
     auto& norm_tensor = parser.tensors.at("blk.0.attn_norm.weight");
     const float* norm_weight = reinterpret_cast<const float*>(
         base + parser.tensor_data_offset + norm_tensor.offset);
-
-    rms_norm(input.data(), norm_weight, embd_dim);
 
     auto& q_tensor = parser.tensors.at("blk.0.attn_q.weight");
     auto& k_tensor = parser.tensors.at("blk.0.attn_k.weight");
@@ -138,14 +137,20 @@ int main(int argc, char** argv) {
     dequantize_q4_K(base + parser.tensor_data_offset + k_tensor.offset, W_K.data(), embd_dim * k_dim);
     dequantize_q4_K(base + parser.tensor_data_offset + v_tensor.offset, W_V.data(), embd_dim * v_dim);
 
-    std::vector<float> q(q_dim), k(k_dim), v(v_dim);
-    mat_vec(W_Q.data(), input.data(), q.data(), q_dim, embd_dim);
-    mat_vec(W_K.data(), input.data(), k.data(), k_dim, embd_dim);
-    mat_vec(W_V.data(), input.data(), v.data(), v_dim, embd_dim);
+    std::vector<float> Q(seq_len * q_dim), K(seq_len * k_dim), V(seq_len * v_dim);
 
-    std::cout << "q shape: " << q_dim << ", k shape: " << k_dim << "\n";
-    std::cout << "q[0..3]:"; for (int i = 0; i < 4; ++i) std::cout << " " << q[i]; std::cout << "\n";
-    std::cout << "k[0..3]:"; for (int i = 0; i < 4; ++i) std::cout << " " << k[i]; std::cout << "\n";
+    for (int t = 0; t < seq_len; ++t) {
+        float* x = input.data() + t * embd_dim;
+        rms_norm(x, norm_weight, embd_dim);
+        mat_vec(W_Q.data(), x, Q.data() + t * q_dim, q_dim, embd_dim);
+        mat_vec(W_K.data(), x, K.data() + t * k_dim, k_dim, embd_dim);
+        mat_vec(W_V.data(), x, V.data() + t * v_dim, v_dim, embd_dim);
+        rope(Q.data() + t * q_dim, t, parser.head_count,    head_dim);
+        rope(K.data() + t * k_dim, t, parser.head_count_kv, head_dim);
+    }
+
+    std::cout << "Q[1][0..3]:"; for (int i = 0; i < 4; ++i) std::cout << " " << Q[q_dim + i]; std::cout << "\n";
+    std::cout << "K[1][0..3]:"; for (int i = 0; i < 4; ++i) std::cout << " " << K[k_dim + i]; std::cout << "\n";
 
     return 0;
 }
