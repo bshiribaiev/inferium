@@ -1,8 +1,6 @@
 #include "forward_pass.hpp"
 #include <algorithm>
 #include <cmath>
-#include <cstdint>
-#include <numeric>
 
 std::vector<float> embed_tokens(
     const std::vector<int>& token_ids,
@@ -78,11 +76,14 @@ void attention(
 
     for (int h = 0; h < n_heads; ++h) {
         int h_kv = h / kv_group;
+
         for (int i = 0; i < seq_len; ++i) {
             const float* q = Q + i * q_stride  + h    * head_dim;
+
             for (int j = 0; j <= i; ++j) {
                 const float* k = K + j * kv_stride + h_kv * head_dim;
                 float dot = 0.0f;
+                
                 for (int d = 0; d < head_dim; ++d)
                     dot += q[d] * k[d];
                 scores[j] = dot / std::sqrt((float)head_dim);
@@ -97,5 +98,18 @@ void attention(
                     o[d] += scores[j] * v[d];
             }
         }
+    }
+}
+
+void output_projection(
+    const float* attn_out, const float* Wo, float* x,
+    int seq_len, int attn_dim, int embd_dim)
+{
+    std::vector<float> proj(embd_dim);
+    for (int t = 0; t < seq_len; ++t) {
+        mat_vec(Wo, attn_out + t * attn_dim, proj.data(), embd_dim, attn_dim);
+        float* row = x + t * embd_dim;
+        for (int i = 0; i < embd_dim; ++i)
+            row[i] += proj[i];
     }
 }
