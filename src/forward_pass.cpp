@@ -113,3 +113,31 @@ void output_projection(
             row[i] += proj[i];
     }
 }
+
+static float silu(float x)
+{
+    return x / (1.0f + std::exp(-x));
+}
+
+void feed_forward(
+    const float* x_norm, const float* Wgate, const float* Wup, const float* Wdown,
+    float* x, int seq_len, int embd_dim, int ffn_dim)
+{
+    std::vector<float> gate(ffn_dim);
+    std::vector<float> up(ffn_dim);
+    std::vector<float> proj(embd_dim);
+
+    for (int t = 0; t < seq_len; ++t) {
+        const float* in = x_norm + t * embd_dim;
+        mat_vec(Wgate, in, gate.data(), ffn_dim, embd_dim);
+        mat_vec(Wup,   in, up.data(),   ffn_dim, embd_dim);
+
+        for (int i = 0; i < ffn_dim; ++i)
+            gate[i] = silu(gate[i]) * up[i];
+
+        mat_vec(Wdown, gate.data(), proj.data(), embd_dim, ffn_dim);
+        float* row = x + t * embd_dim;
+        for (int i = 0; i < embd_dim; ++i)
+            row[i] += proj[i];
+    }
+}

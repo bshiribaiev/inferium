@@ -19,3 +19,7 @@ void attention(
 void output_projection(
     const float* attn_out, const float* Wo, float* x,
     int seq_len, int attn_dim, int embd_dim);
+
+void feed_forward(
+    const float* x_norm, const float* Wgate, const float* Wup, const float* Wdown,
+    float* x, int seq_len, int embd_dim, int ffn_dim);
