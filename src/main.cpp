@@ -123,7 +123,7 @@ int main(int argc, char** argv) {
 
     const uint8_t* tensor_data = base + parser.tensor_data_offset;
 
-    // Norm weights are stored as raw F32; attention/ffn weights are quantized.
+    // Norm weights are raw F32; everything else is quantized.
     auto norm_weight = [&](const std::string& name) -> const float* {
         return reinterpret_cast<const float*>(tensor_data + parser.tensors.at(name).offset);
     };
@@ -137,13 +137,12 @@ int main(int argc, char** argv) {
         return out;
     };
 
-    // Architectural dims, constant across blocks.
     int64_t q_dim   = parser.tensors.at("blk.0.attn_q.weight").dims[1];
     int64_t k_dim   = parser.tensors.at("blk.0.attn_k.weight").dims[1];
     int64_t v_dim   = parser.tensors.at("blk.0.attn_v.weight").dims[1];
     int64_t ffn_dim = parser.tensors.at("blk.0.ffn_gate.weight").dims[1];
 
-    // Reused scratch buffers (input is the residual stream, carried across blocks).
+    // input is the residual stream, mutated in place across every block.
     std::vector<float> x_norm(seq_len * embd_dim);
     std::vector<float> Q(seq_len * q_dim), K(seq_len * k_dim), V(seq_len * v_dim);
     std::vector<float> attn_out(seq_len * q_dim);
@@ -151,7 +150,6 @@ int main(int argc, char** argv) {
     for (uint64_t layer = 0; layer < parser.block_count; ++layer) {
         std::string prefix = "blk." + std::to_string(layer) + ".";
 
-        // Attention sub-block: x = x + Wo @ attention(rope(QKV(norm(x))))
         const float* attn_norm = norm_weight(prefix + "attn_norm.weight");
         std::vector<float> W_Q = dequant_weight(prefix + "attn_q.weight");
         std::vector<float> W_K = dequant_weight(prefix + "attn_k.weight");
@@ -174,7 +172,6 @@ int main(int argc, char** argv) {
         output_projection(attn_out.data(), W_O.data(), input.data(),
                           seq_len, q_dim, embd_dim);
 
-        // FFN sub-block: x = x + SwiGLU(norm(x))
         const float* ffn_norm = norm_weight(prefix + "ffn_norm.weight");
         std::vector<float> W_gate = dequant_weight(prefix + "ffn_gate.weight");
         std::vector<float> W_up   = dequant_weight(prefix + "ffn_up.weight");
@@ -190,12 +187,18 @@ int main(int argc, char** argv) {
                      input.data(), seq_len, embd_dim, ffn_dim);
     }
 
-    // input now holds the hidden state for every token after all blocks.
-    std::cout << "hidden[last][0..3]:";
-    const float* last = input.data() + (seq_len - 1) * embd_dim;
-    for (int i = 0; i < 4; ++i)
-        std::cout << " " << last[i];
-    std::cout << "\n";
+    // Only the last token's hidden state predicts the next token.
+    std::vector<float> hidden(input.data() + (seq_len - 1) * embd_dim,
+                              input.data() + seq_len * embd_dim);
+    rms_norm(hidden.data(), norm_weight("output_norm.weight"), embd_dim);
+
+    std::vector<float> W_out = dequant_weight("output.weight");
+    std::vector<float> logits(vocab_size);
+    mat_vec(W_out.data(), hidden.data(), logits.data(), vocab_size, embd_dim);
+
+    int next_id = (int)(std::max_element(logits.begin(), logits.end()) - logits.begin());
+    std::cout << "next token: " << next_id
+              << " (\"" << tokenizer.vocab[next_id] << "\")\n";
 
     return 0;
 }
