@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <iostream>
 #include <cstdint>
 #include <cstring>
@@ -120,46 +121,80 @@ int main(int argc, char** argv) {
     int seq_len  = (int)token_ids.size();
     int head_dim = embd_dim / (int)parser.head_count;
 
-    auto& norm_tensor = parser.tensors.at("blk.0.attn_norm.weight");
-    const float* norm_weight = reinterpret_cast<const float*>(
-        base + parser.tensor_data_offset + norm_tensor.offset);
+    const uint8_t* tensor_data = base + parser.tensor_data_offset;
 
-    auto& q_tensor = parser.tensors.at("blk.0.attn_q.weight");
-    auto& k_tensor = parser.tensors.at("blk.0.attn_k.weight");
-    auto& v_tensor = parser.tensors.at("blk.0.attn_v.weight");
+    // Norm weights are stored as raw F32; attention/ffn weights are quantized.
+    auto norm_weight = [&](const std::string& name) -> const float* {
+        return reinterpret_cast<const float*>(tensor_data + parser.tensors.at(name).offset);
+    };
+    auto dequant_weight = [&](const std::string& name) -> std::vector<float> {
+        const TensorInfo& t = parser.tensors.at(name);
+        int64_t n = 1;
+        for (uint32_t d = 0; d < t.n_dims; ++d)
+            n *= t.dims[d];
+        std::vector<float> out(n);
+        dequantize(t.dtype, tensor_data + t.offset, out.data(), n);
+        return out;
+    };
 
-    int64_t q_dim = q_tensor.dims[1];
-    int64_t k_dim = k_tensor.dims[1];
-    int64_t v_dim = v_tensor.dims[1];
+    // Architectural dims, constant across blocks.
+    int64_t q_dim   = parser.tensors.at("blk.0.attn_q.weight").dims[1];
+    int64_t k_dim   = parser.tensors.at("blk.0.attn_k.weight").dims[1];
+    int64_t v_dim   = parser.tensors.at("blk.0.attn_v.weight").dims[1];
+    int64_t ffn_dim = parser.tensors.at("blk.0.ffn_gate.weight").dims[1];
 
-    std::cout << "attn_q dtype: " << q_tensor.dtype
-              << " attn_k dtype: " << k_tensor.dtype
-              << " attn_v dtype: " << v_tensor.dtype << "\n";
-
-    std::vector<float> W_Q(embd_dim * q_dim), W_K(embd_dim * k_dim), W_V(embd_dim * v_dim);
-    dequantize(q_tensor.dtype, base + parser.tensor_data_offset + q_tensor.offset, W_Q.data(), embd_dim * q_dim);
-    dequantize(k_tensor.dtype, base + parser.tensor_data_offset + k_tensor.offset, W_K.data(), embd_dim * k_dim);
-    dequantize(v_tensor.dtype, base + parser.tensor_data_offset + v_tensor.offset, W_V.data(), embd_dim * v_dim);
-
+    // Reused scratch buffers (input is the residual stream, carried across blocks).
+    std::vector<float> x_norm(seq_len * embd_dim);
     std::vector<float> Q(seq_len * q_dim), K(seq_len * k_dim), V(seq_len * v_dim);
+    std::vector<float> attn_out(seq_len * q_dim);
 
-    for (int t = 0; t < seq_len; ++t) {
-        float* x = input.data() + t * embd_dim;
-        rms_norm(x, norm_weight, embd_dim);
-        mat_vec(W_Q.data(), x, Q.data() + t * q_dim, q_dim, embd_dim);
-        mat_vec(W_K.data(), x, K.data() + t * k_dim, k_dim, embd_dim);
-        mat_vec(W_V.data(), x, V.data() + t * v_dim, v_dim, embd_dim);
-        rope(Q.data() + t * q_dim, t, parser.head_count,    head_dim);
-        rope(K.data() + t * k_dim, t, parser.head_count_kv, head_dim);
+    for (uint64_t layer = 0; layer < parser.block_count; ++layer) {
+        std::string prefix = "blk." + std::to_string(layer) + ".";
+
+        // Attention sub-block: x = x + Wo @ attention(rope(QKV(norm(x))))
+        const float* attn_norm = norm_weight(prefix + "attn_norm.weight");
+        std::vector<float> W_Q = dequant_weight(prefix + "attn_q.weight");
+        std::vector<float> W_K = dequant_weight(prefix + "attn_k.weight");
+        std::vector<float> W_V = dequant_weight(prefix + "attn_v.weight");
+        std::vector<float> W_O = dequant_weight(prefix + "attn_output.weight");
+
+        for (int t = 0; t < seq_len; ++t) {
+            const float* x = input.data() + t * embd_dim;
+            float* xn = x_norm.data() + t * embd_dim;
+            std::copy(x, x + embd_dim, xn);
+            rms_norm(xn, attn_norm, embd_dim);
+            mat_vec(W_Q.data(), xn, Q.data() + t * q_dim, q_dim, embd_dim);
+            mat_vec(W_K.data(), xn, K.data() + t * k_dim, k_dim, embd_dim);
+            mat_vec(W_V.data(), xn, V.data() + t * v_dim, v_dim, embd_dim);
+            rope(Q.data() + t * q_dim, t, parser.head_count,    head_dim);
+            rope(K.data() + t * k_dim, t, parser.head_count_kv, head_dim);
+        }
+        attention(Q.data(), K.data(), V.data(), attn_out.data(),
+                  seq_len, parser.head_count, parser.head_count_kv, head_dim);
+        output_projection(attn_out.data(), W_O.data(), input.data(),
+                          seq_len, q_dim, embd_dim);
+
+        // FFN sub-block: x = x + SwiGLU(norm(x))
+        const float* ffn_norm = norm_weight(prefix + "ffn_norm.weight");
+        std::vector<float> W_gate = dequant_weight(prefix + "ffn_gate.weight");
+        std::vector<float> W_up   = dequant_weight(prefix + "ffn_up.weight");
+        std::vector<float> W_down = dequant_weight(prefix + "ffn_down.weight");
+
+        for (int t = 0; t < seq_len; ++t) {
+            const float* x = input.data() + t * embd_dim;
+            float* xn = x_norm.data() + t * embd_dim;
+            std::copy(x, x + embd_dim, xn);
+            rms_norm(xn, ffn_norm, embd_dim);
+        }
+        feed_forward(x_norm.data(), W_gate.data(), W_up.data(), W_down.data(),
+                     input.data(), seq_len, embd_dim, ffn_dim);
     }
 
-    std::vector<float> attn_out(seq_len * q_dim);
-    attention(Q.data(), K.data(), V.data(), attn_out.data(),
-              seq_len, parser.head_count, parser.head_count_kv, head_dim);
-
-    std::cout << "attn_out[1][0..3]:";
+    // input now holds the hidden state for every token after all blocks.
+    std::cout << "hidden[last][0..3]:";
+    const float* last = input.data() + (seq_len - 1) * embd_dim;
     for (int i = 0; i < 4; ++i)
-        std::cout << " " << attn_out[q_dim + i];
+        std::cout << " " << last[i];
     std::cout << "\n";
 
     return 0;
