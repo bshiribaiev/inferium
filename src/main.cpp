@@ -79,48 +79,26 @@ MappedFile::~MappedFile() {
     }
 }
 
-int main(int argc, char** argv) {
-    if (argc < 2) {
-        return 1;
-    }
+struct LayerWeights {
+    const float* attn_norm;
+    const float* ffn_norm;
+    std::vector<float> Wq, Wk, Wv, Wo;
+    std::vector<float> Wgate, Wup, Wdown;
+};
 
-    MappedFile model(argv[1]);
-    const uint8_t* base = static_cast<const uint8_t*>(model.data());
+struct Model {
+    int64_t embd_dim, vocab_size;
+    int64_t q_dim, k_dim, v_dim, ffn_dim;
+    int head_dim, n_heads, n_kv_heads;
+    uint64_t n_layers;
 
-    GgufParser parser(base, model.size());
-    std::cout << "arch: "             << parser.arch             << "\n";
-    std::cout << "block_count: "      << parser.block_count      << "\n";
-    std::cout << "embedding_length: " << parser.embedding_length << "\n";
-    std::cout << "tensors: "          << parser.tensors.size()   << "\n";
-    std::cout << "tensor_data_offset: " << parser.tensor_data_offset << "\n";
+    std::vector<float> embd_table;
+    std::vector<LayerWeights> layers;
+    const float* final_norm;
+    std::vector<float> Wout;
+};
 
-    std::cout << "vocab size: " << parser.vocab_tokens.size() << "\n";
-
-    Tokenizer tokenizer(parser.vocab_tokens, parser.vocab_scores,
-                        parser.bos_token_id, parser.eos_token_id);
-
-    std::string prompt = (argc >= 3) ? argv[2] : "Hello";
-    std::vector<int> token_ids = tokenizer.encode(prompt);
-
-    std::cout << "prompt: \"" << prompt << "\"\n";
-    std::cout << "tokens:";
-    for (int id : token_ids)
-        std::cout << " " << id << "(\"" << tokenizer.vocab[id] << "\")";
-    std::cout << "\n";
-    std::cout << "decoded: \"" << tokenizer.decode(token_ids) << "\"\n";
-
-    auto& embd_tensor = parser.tensors.at("token_embd.weight");
-    const uint8_t* embd_bytes = base + parser.tensor_data_offset + embd_tensor.offset;
-    int64_t embd_dim   = embd_tensor.dims[0];
-    int64_t vocab_size = embd_tensor.dims[1];
-    std::vector<float> embd_table(embd_dim * vocab_size);
-    dequantize(embd_tensor.dtype, embd_bytes, embd_table.data(), embd_dim * vocab_size);
-
-    std::vector<float> input = embed_tokens(token_ids, embd_table, embd_dim);
-
-    int seq_len  = (int)token_ids.size();
-    int head_dim = embd_dim / (int)parser.head_count;
-
+Model load_model(const GgufParser& parser, const uint8_t* base) {
     const uint8_t* tensor_data = base + parser.tensor_data_offset;
 
     // Norm weights are raw F32; everything else is quantized.
@@ -137,68 +115,118 @@ int main(int argc, char** argv) {
         return out;
     };
 
-    int64_t q_dim   = parser.tensors.at("blk.0.attn_q.weight").dims[1];
-    int64_t k_dim   = parser.tensors.at("blk.0.attn_k.weight").dims[1];
-    int64_t v_dim   = parser.tensors.at("blk.0.attn_v.weight").dims[1];
-    int64_t ffn_dim = parser.tensors.at("blk.0.ffn_gate.weight").dims[1];
+    Model m;
+    m.embd_dim    = parser.embedding_length;
+    m.vocab_size  = parser.tensors.at("token_embd.weight").dims[1];
+    m.q_dim       = parser.tensors.at("blk.0.attn_q.weight").dims[1];
+    m.k_dim       = parser.tensors.at("blk.0.attn_k.weight").dims[1];
+    m.v_dim       = parser.tensors.at("blk.0.attn_v.weight").dims[1];
+    m.ffn_dim     = parser.tensors.at("blk.0.ffn_gate.weight").dims[1];
+    m.n_heads     = (int)parser.head_count;
+    m.n_kv_heads  = (int)parser.head_count_kv;
+    m.head_dim    = m.embd_dim / m.n_heads;
+    m.n_layers    = parser.block_count;
+
+    m.embd_table  = dequant_weight("token_embd.weight");
+    m.final_norm  = norm_weight("output_norm.weight");
+    m.Wout        = dequant_weight("output.weight");
+
+    m.layers.resize(m.n_layers);
+    for (uint64_t l = 0; l < m.n_layers; ++l) {
+        std::string prefix = "blk." + std::to_string(l) + ".";
+        LayerWeights& layer = m.layers[l];
+        layer.attn_norm = norm_weight(prefix + "attn_norm.weight");
+        layer.ffn_norm  = norm_weight(prefix + "ffn_norm.weight");
+        layer.Wq    = dequant_weight(prefix + "attn_q.weight");
+        layer.Wk    = dequant_weight(prefix + "attn_k.weight");
+        layer.Wv    = dequant_weight(prefix + "attn_v.weight");
+        layer.Wo    = dequant_weight(prefix + "attn_output.weight");
+        layer.Wgate = dequant_weight(prefix + "ffn_gate.weight");
+        layer.Wup   = dequant_weight(prefix + "ffn_up.weight");
+        layer.Wdown = dequant_weight(prefix + "ffn_down.weight");
+    }
+    return m;
+}
+
+int predict_next_token(const Model& m, const std::vector<int>& token_ids) {
+    int seq_len = (int)token_ids.size();
+    int64_t embd_dim = m.embd_dim;
 
     // input is the residual stream, mutated in place across every block.
+    std::vector<float> input = embed_tokens(token_ids, m.embd_table, embd_dim);
     std::vector<float> x_norm(seq_len * embd_dim);
-    std::vector<float> Q(seq_len * q_dim), K(seq_len * k_dim), V(seq_len * v_dim);
-    std::vector<float> attn_out(seq_len * q_dim);
+    std::vector<float> Q(seq_len * m.q_dim), K(seq_len * m.k_dim), V(seq_len * m.v_dim);
+    std::vector<float> attn_out(seq_len * m.q_dim);
 
-    for (uint64_t layer = 0; layer < parser.block_count; ++layer) {
-        std::string prefix = "blk." + std::to_string(layer) + ".";
-
-        const float* attn_norm = norm_weight(prefix + "attn_norm.weight");
-        std::vector<float> W_Q = dequant_weight(prefix + "attn_q.weight");
-        std::vector<float> W_K = dequant_weight(prefix + "attn_k.weight");
-        std::vector<float> W_V = dequant_weight(prefix + "attn_v.weight");
-        std::vector<float> W_O = dequant_weight(prefix + "attn_output.weight");
-
+    for (const LayerWeights& layer : m.layers) {
         for (int t = 0; t < seq_len; ++t) {
             const float* x = input.data() + t * embd_dim;
             float* xn = x_norm.data() + t * embd_dim;
             std::copy(x, x + embd_dim, xn);
-            rms_norm(xn, attn_norm, embd_dim);
-            mat_vec(W_Q.data(), xn, Q.data() + t * q_dim, q_dim, embd_dim);
-            mat_vec(W_K.data(), xn, K.data() + t * k_dim, k_dim, embd_dim);
-            mat_vec(W_V.data(), xn, V.data() + t * v_dim, v_dim, embd_dim);
-            rope(Q.data() + t * q_dim, t, parser.head_count,    head_dim);
-            rope(K.data() + t * k_dim, t, parser.head_count_kv, head_dim);
+            rms_norm(xn, layer.attn_norm, embd_dim);
+            mat_vec(layer.Wq.data(), xn, Q.data() + t * m.q_dim, m.q_dim, embd_dim);
+            mat_vec(layer.Wk.data(), xn, K.data() + t * m.k_dim, m.k_dim, embd_dim);
+            mat_vec(layer.Wv.data(), xn, V.data() + t * m.v_dim, m.v_dim, embd_dim);
+            rope(Q.data() + t * m.q_dim, t, m.n_heads,    m.head_dim);
+            rope(K.data() + t * m.k_dim, t, m.n_kv_heads, m.head_dim);
         }
         attention(Q.data(), K.data(), V.data(), attn_out.data(),
-                  seq_len, parser.head_count, parser.head_count_kv, head_dim);
-        output_projection(attn_out.data(), W_O.data(), input.data(),
-                          seq_len, q_dim, embd_dim);
-
-        const float* ffn_norm = norm_weight(prefix + "ffn_norm.weight");
-        std::vector<float> W_gate = dequant_weight(prefix + "ffn_gate.weight");
-        std::vector<float> W_up   = dequant_weight(prefix + "ffn_up.weight");
-        std::vector<float> W_down = dequant_weight(prefix + "ffn_down.weight");
+                  seq_len, m.n_heads, m.n_kv_heads, m.head_dim);
+        output_projection(attn_out.data(), layer.Wo.data(), input.data(),
+                          seq_len, m.q_dim, embd_dim);
 
         for (int t = 0; t < seq_len; ++t) {
             const float* x = input.data() + t * embd_dim;
             float* xn = x_norm.data() + t * embd_dim;
             std::copy(x, x + embd_dim, xn);
-            rms_norm(xn, ffn_norm, embd_dim);
+            rms_norm(xn, layer.ffn_norm, embd_dim);
         }
-        feed_forward(x_norm.data(), W_gate.data(), W_up.data(), W_down.data(),
-                     input.data(), seq_len, embd_dim, ffn_dim);
+        feed_forward(x_norm.data(), layer.Wgate.data(), layer.Wup.data(), layer.Wdown.data(),
+                     input.data(), seq_len, embd_dim, m.ffn_dim);
     }
 
     // Only the last token's hidden state predicts the next token.
     std::vector<float> hidden(input.data() + (seq_len - 1) * embd_dim,
                               input.data() + seq_len * embd_dim);
-    rms_norm(hidden.data(), norm_weight("output_norm.weight"), embd_dim);
+    rms_norm(hidden.data(), m.final_norm, embd_dim);
 
-    std::vector<float> W_out = dequant_weight("output.weight");
-    std::vector<float> logits(vocab_size);
-    mat_vec(W_out.data(), hidden.data(), logits.data(), vocab_size, embd_dim);
+    std::vector<float> logits(m.vocab_size);
+    mat_vec(m.Wout.data(), hidden.data(), logits.data(), m.vocab_size, embd_dim);
 
-    int next_id = (int)(std::max_element(logits.begin(), logits.end()) - logits.begin());
-    std::cout << "next token: " << next_id
-              << " (\"" << tokenizer.vocab[next_id] << "\")\n";
+    return (int)(std::max_element(logits.begin(), logits.end()) - logits.begin());
+}
+
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        return 1;
+    }
+
+    MappedFile model_file(argv[1]);
+    const uint8_t* base = static_cast<const uint8_t*>(model_file.data());
+
+    GgufParser parser(base, model_file.size());
+    Tokenizer tokenizer(parser.vocab_tokens, parser.vocab_scores,
+                        parser.bos_token_id, parser.eos_token_id);
+    Model model = load_model(parser, base);
+
+    std::string prompt = (argc >= 3) ? argv[2] : "Hello";
+    std::vector<int> token_ids = tokenizer.encode(prompt);
+
+    int max_new_tokens = 50;
+    std::string text = tokenizer.decode(token_ids);
+    std::cout << text << std::flush;
+
+    for (int i = 0; i < max_new_tokens; ++i) {
+        int next_id = predict_next_token(model, token_ids);
+        if (next_id == tokenizer.eos_id) break;
+
+        token_ids.push_back(next_id);
+        // decode strips a leading space, so re-decode the whole sequence and print the delta.
+        std::string updated = tokenizer.decode(token_ids);
+        std::cout << updated.substr(text.size()) << std::flush;
+        text = updated;
+    }
+    std::cout << "\n";
 
     return 0;
 }
