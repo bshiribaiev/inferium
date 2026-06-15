@@ -1,6 +1,8 @@
 #include "forward_pass.hpp"
 #include <algorithm>
 #include <cmath>
+#include <thread>
+#include <vector>
 
 std::vector<float> embed_tokens(
     const std::vector<int>& token_ids,
@@ -26,15 +28,40 @@ void rms_norm(float* x, const float* weight, int n, float eps)
         x[i] = x[i] * scale * weight[i];
 }
 
+template <typename Fn>
+static void parallel_for(int count, Fn process_range)
+{
+    unsigned n_threads = std::max(1u, std::thread::hardware_concurrency());
+    n_threads = std::min(n_threads, (unsigned)count);
+    if (n_threads <= 1) {
+        process_range(0, count);
+        return;
+    }
+
+    int chunk = (count + n_threads - 1) / n_threads;
+    std::vector<std::thread> threads;
+    for (unsigned t = 0; t < n_threads; ++t) {
+        int start = t * chunk;
+        int end = std::min(start + chunk, count);
+        if (start >= end) break;
+        threads.emplace_back(process_range, start, end);
+    }
+    for (std::thread& th : threads)
+        th.join();
+}
+
 void mat_vec(const float* W, const float* x, float* out, int out_dim, int in_dim)
 {
-    for (int i = 0; i < out_dim; ++i) {
-        float sum = 0.0f;
-        const float* row = W + i * in_dim;
-        for (int j = 0; j < in_dim; ++j)
-            sum += row[j] * x[j];
-        out[i] = sum;
-    }
+    // Output rows are independent, so each can be computed on its own thread.
+    parallel_for(out_dim, [&](int start, int end) {
+        for (int i = start; i < end; ++i) {
+            float sum = 0.0f;
+            const float* row = W + i * in_dim;
+            for (int j = 0; j < in_dim; ++j)
+                sum += row[j] * x[j];
+            out[i] = sum;
+        }
+    });
 }
 
 void rope(float* x, int pos, int n_heads, int head_dim, float theta_base)
