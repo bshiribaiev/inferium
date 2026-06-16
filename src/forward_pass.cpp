@@ -52,7 +52,6 @@ static void parallel_for(int count, Fn process_range)
 
 void mat_vec(const float* W, const float* x, float* out, int out_dim, int in_dim)
 {
-    // Output rows are independent, so each can be computed on its own thread.
     parallel_for(out_dim, [&](int start, int end) {
         for (int i = start; i < end; ++i) {
             float sum = 0.0f;

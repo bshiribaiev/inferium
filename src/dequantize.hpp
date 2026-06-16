@@ -52,10 +52,10 @@ static inline void unpack_sub_block_scale_min(int j, const uint8_t* packed, uint
 }
 
 struct block_q6_K {
-    uint8_t ql[128];    // lower 4 bits of each 6-bit weight
-    uint8_t qh[64];     // upper 2 bits of each 6-bit weight
-    int8_t  scales[16]; // scale per group of 16 values
-    uint16_t d;         // fp16 super-scale
+    uint8_t  bits_low4[128];
+    uint8_t  bits_high2[64];
+    int8_t   group_scales[16];
+    uint16_t super_scale;
 };
 static_assert(sizeof(block_q6_K) == 210, "block_q6_K size mismatch");
 
@@ -65,28 +65,28 @@ static inline void dequantize_q6_K(const uint8_t* weight_bytes, float* out, int6
     int num_blocks = num_values / QK_K;
 
     for (int i = 0; i < num_blocks; ++i) {
-        const float d       = fp16_to_fp32(blocks[i].d);
-        const uint8_t* ql   = blocks[i].ql;
-        const uint8_t* qh   = blocks[i].qh;
-        const int8_t*  sc   = blocks[i].scales;
+        const float super_scale      = fp16_to_fp32(blocks[i].super_scale);
+        const uint8_t* bits_low4     = blocks[i].bits_low4;
+        const uint8_t* bits_high2    = blocks[i].bits_high2;
+        const int8_t*  group_scales  = blocks[i].group_scales;
         float* y = out + i * QK_K;
 
         for (int n = 0; n < QK_K; n += 128) {
             for (int l = 0; l < 32; ++l) {
-                int is     = l / 16;
-                int8_t q1 = (int8_t)((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
-                int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
-                int8_t q3 = (int8_t)((ql[l +  0]  >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
-                int8_t q4 = (int8_t)((ql[l + 32]  >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
-                y[l +  0] = d * sc[is + 0] * q1;
-                y[l + 32] = d * sc[is + 2] * q2;
-                y[l + 64] = d * sc[is + 4] * q3;
-                y[l + 96] = d * sc[is + 6] * q4;
+                int group        = l / 16;
+                int8_t q1 = (int8_t)((bits_low4[l +  0] & 0xF) | (((bits_high2[l] >> 0) & 3) << 4)) - 32;
+                int8_t q2 = (int8_t)((bits_low4[l + 32] & 0xF) | (((bits_high2[l] >> 2) & 3) << 4)) - 32;
+                int8_t q3 = (int8_t)((bits_low4[l +  0]  >> 4) | (((bits_high2[l] >> 4) & 3) << 4)) - 32;
+                int8_t q4 = (int8_t)((bits_low4[l + 32]  >> 4) | (((bits_high2[l] >> 6) & 3) << 4)) - 32;
+                y[l +  0] = super_scale * group_scales[group + 0] * q1;
+                y[l + 32] = super_scale * group_scales[group + 2] * q2;
+                y[l + 64] = super_scale * group_scales[group + 4] * q3;
+                y[l + 96] = super_scale * group_scales[group + 6] * q4;
             }
-            y  += 128;
-            ql += 64;
-            qh += 32;
-            sc += 8;
+            y           += 128;
+            bits_low4   += 64;
+            bits_high2  += 32;
+            group_scales += 8;
         }
     }
 }
