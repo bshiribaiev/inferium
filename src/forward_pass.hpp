@@ -1,6 +1,8 @@
 #pragma once
 #include <vector>
 
+void set_num_threads(int n);
+
 std::vector<float> embed_tokens(
     const std::vector<int>& token_ids,
     const std::vector<float>& embd_table,

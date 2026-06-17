@@ -28,10 +28,24 @@ void rms_norm(float* x, const float* weight, int n, float eps)
         x[i] = x[i] * scale * weight[i];
 }
 
+static int g_num_threads = 0;
+
+void set_num_threads(int n)
+{
+    g_num_threads = n;
+}
+
+static unsigned resolve_thread_count()
+{
+    if (g_num_threads > 0)
+        return (unsigned)g_num_threads;
+    return std::max(1u, std::thread::hardware_concurrency());
+}
+
 template <typename Fn>
 static void parallel_for(int count, Fn process_range)
 {
-    unsigned n_threads = std::max(1u, std::thread::hardware_concurrency());
+    unsigned n_threads = resolve_thread_count();
     n_threads = std::min(n_threads, (unsigned)count);
     if (n_threads <= 1) {
         process_range(0, count);
