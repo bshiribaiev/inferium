@@ -39,10 +39,11 @@ int main(int argc, char** argv) {
     std::string text = tokenizer.decode(token_ids);
     std::cout << text << std::flush;
 
+    Session session(model, 2048);
     int generated = 0;
     auto start = std::chrono::steady_clock::now();
+    int next_id = session.advance(token_ids);
     for (int i = 0; i < max_new_tokens; ++i) {
-        int next_id = predict_next_token(model, token_ids);
         if (next_id == tokenizer.eos_id) break;
 
         token_ids.push_back(next_id);
@@ -51,6 +52,8 @@ int main(int argc, char** argv) {
         std::string updated = tokenizer.decode(token_ids);
         std::cout << updated.substr(text.size()) << std::flush;
         text = updated;
+
+        next_id = session.advance({next_id});
     }
     auto end = std::chrono::steady_clock::now();
     std::cout << "\n";

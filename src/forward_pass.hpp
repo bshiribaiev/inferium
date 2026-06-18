@@ -16,7 +16,7 @@ void rope(float* x, int pos, int n_heads, int head_dim, float theta_base = 10000
 
 void attention(
     const float* Q, const float* K, const float* V, float* out,
-    int seq_len, int n_heads, int n_kv_heads, int head_dim);
+    int n_new, int past_len, int n_heads, int n_kv_heads, int head_dim);
 
 void output_projection(
     const float* attn_out, const float* Wo, float* x,
