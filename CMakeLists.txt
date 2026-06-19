@@ -12,5 +12,6 @@ add_executable(inferium
     src/inference.cpp
     src/gguf_parser.cpp
     src/tokenizer.cpp
-    src/forward_pass.cpp)
+    src/forward_pass.cpp
+    src/thread_pool.cpp)
 target_include_directories(inferium PRIVATE include)

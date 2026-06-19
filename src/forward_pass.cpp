@@ -1,9 +1,13 @@
 #include "forward_pass.hpp"
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 #include <vector>
 #include <arm_neon.h>
+
+#include "thread_pool.hpp"
 
 std::vector<float> embed_tokens(
     const std::vector<int>& token_ids,
@@ -43,6 +47,12 @@ static unsigned resolve_thread_count()
     return std::max(1u, std::thread::hardware_concurrency());
 }
 
+static ThreadPool& global_pool()
+{
+    static ThreadPool pool(resolve_thread_count());
+    return pool;
+}
+
 template <typename Fn>
 static void parallel_for(int count, Fn process_range)
 {
@@ -54,15 +64,29 @@ static void parallel_for(int count, Fn process_range)
     }
 
     int chunk = (count + n_threads - 1) / n_threads;
-    std::vector<std::thread> threads;
+    std::mutex m;
+    std::condition_variable done;
+    int pending = 0;
+
+    ThreadPool& pool = global_pool();
     for (unsigned t = 0; t < n_threads; ++t) {
         int start = t * chunk;
         int end = std::min(start + chunk, count);
         if (start >= end) break;
-        threads.emplace_back(process_range, start, end);
+        {
+            std::lock_guard<std::mutex> lock(m);
+            ++pending;
+        }
+        pool.submit([&, start, end] {
+            process_range(start, end);
+            std::lock_guard<std::mutex> lock(m);
+            --pending;
+            done.notify_one();
+        });
     }
-    for (std::thread& th : threads)
-        th.join();
+
+    std::unique_lock<std::mutex> lock(m);
+    done.wait(lock, [&] { return pending == 0; });
 }
 
 static float dot(const float* a, const float* b, int n)
