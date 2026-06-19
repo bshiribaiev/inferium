@@ -3,6 +3,7 @@
 #include <cmath>
 #include <thread>
 #include <vector>
+#include <arm_neon.h>
 
 std::vector<float> embed_tokens(
     const std::vector<int>& token_ids,
@@ -64,16 +65,35 @@ static void parallel_for(int count, Fn process_range)
         th.join();
 }
 
+static float dot(const float* a, const float* b, int n)
+{
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    float32x4_t acc2 = vdupq_n_f32(0.0f);
+    float32x4_t acc3 = vdupq_n_f32(0.0f);
+
+    int j = 0;
+    for (; j + 16 <= n; j += 16) {
+        acc0 = vfmaq_f32(acc0, vld1q_f32(a + j),      vld1q_f32(b + j));
+        acc1 = vfmaq_f32(acc1, vld1q_f32(a + j + 4),  vld1q_f32(b + j + 4));
+        acc2 = vfmaq_f32(acc2, vld1q_f32(a + j + 8),  vld1q_f32(b + j + 8));
+        acc3 = vfmaq_f32(acc3, vld1q_f32(a + j + 12), vld1q_f32(b + j + 12));
+    }
+    for (; j + 4 <= n; j += 4)
+        acc0 = vfmaq_f32(acc0, vld1q_f32(a + j), vld1q_f32(b + j));
+
+    float sum = vaddvq_f32(acc0) + vaddvq_f32(acc1)
+              + vaddvq_f32(acc2) + vaddvq_f32(acc3);
+    for (; j < n; ++j)
+        sum += a[j] * b[j];
+    return sum;
+}
+
 void mat_vec(const float* W, const float* x, float* out, int out_dim, int in_dim)
 {
     parallel_for(out_dim, [&](int start, int end) {
-        for (int i = start; i < end; ++i) {
-            float sum = 0.0f;
-            const float* row = W + i * in_dim;
-            for (int j = 0; j < in_dim; ++j)
-                sum += row[j] * x[j];
-            out[i] = sum;
-        }
+        for (int i = start; i < end; ++i)
+            out[i] = dot(W + i * in_dim, x, in_dim);
     });
 }
 
