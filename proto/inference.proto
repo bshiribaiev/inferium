@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package inferium;
+
+service Inference {
+    rpc Generate(GenerateRequest) returns (GenerateReply);
+    rpc Health(HealthRequest) returns (HealthReply);
+}
+
+message GenerateRequest {
+    string prompt = 1;
+    int32 max_tokens = 2;
+}
+
+message GenerateReply {
+    string text = 1;
+    int32 prompt_tokens = 2;
+    int32 generated_tokens = 3;
+}
+
+message HealthRequest {}
+
+message HealthReply {
+    bool ok = 1;
+}

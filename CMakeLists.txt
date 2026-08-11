@@ -20,7 +20,10 @@ add_library(inferium_core STATIC
     src/tokenizer.cpp
     src/forward_pass.cpp
     src/thread_pool.cpp
-    src/engine.cpp)
+    src/engine.cpp
+    src/model_loader.cpp
+    src/server_options.cpp
+    src/http_api.cpp)
 target_include_directories(inferium_core PUBLIC src include)
 target_link_libraries(inferium_core PUBLIC Threads::Threads)
 
@@ -29,3 +32,6 @@ target_link_libraries(inferium PRIVATE inferium_core)
 
 add_executable(inferium_bench src/bench.cpp)
 target_link_libraries(inferium_bench PRIVATE inferium_core)
+
+add_executable(inferium_server src/server_main.cpp)
+target_link_libraries(inferium_server PRIVATE inferium_core)
