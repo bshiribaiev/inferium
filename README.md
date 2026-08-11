@@ -1,6 +1,6 @@
 # inferium
 
-A CPU inference engine for Llama-style LLMs in C++17.
+A CPU inference engine for Llama-style LLMs.
 
 It implements GGUF parsing, `Q4_K`/`Q6_K` dequantization, RMSNorm, RoPE, grouped-query
 attention, SwiGLU, and greedy sampling on the standard library and ARM NEON intrinsics.
