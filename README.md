@@ -2,10 +2,10 @@
 
 The simplest CPU inference engine for Llama-style LLMs, written from scratch in C++17.
 
-No BLAS, no ggml, no PyTorch. It `mmap`s a GGUF file, dequantizes the weights, and runs
-the whole transformer by hand — RMSNorm, RoPE, grouped-query attention, SwiGLU, greedy
-sampling. Then it serves that over HTTP with continuous batching, and spreads requests
-across worker nodes over gRPC.
+Every layer is built directly on the standard library and ARM NEON intrinsics: GGUF
+parsing, `Q4_K`/`Q6_K` dequantization, RMSNorm, RoPE, grouped-query attention, SwiGLU,
+greedy sampling. It `mmap`s the model file, serves requests over HTTP with continuous
+batching, and spreads them across worker nodes over gRPC.
 
 I wrote this to find out where inference actually spends its time. The short answer: not
 where I expected. See efficiency notes.
@@ -36,8 +36,8 @@ curl -LO https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/m
 You get ` Paris.` and then some rambling about ancient Rome, at ~9 tok/s on an M4. It's a
 1.1B model doing greedy sampling on a CPU — set expectations accordingly.
 
-Threads default to core count, override with `INFERIUM_THREADS=8`. Don't bother going
-above 8, it gets slower (again, efficiency notes).
+Threads default to core count, override with `INFERIUM_THREADS=8`. Eight is the sweet
+spot; past that it slows down (again, efficiency notes).
 
 ## serving
 
@@ -55,8 +55,8 @@ curl -X POST http://127.0.0.1:8080/generate \
 {"text":" Paris.\n\n2. B.C. ...","prompt_tokens":6,"generated_tokens":32}
 ```
 
-Fire 8 of those at once and they don't queue up behind each other — they join a running
-batch and share one pass over the weights. That's the whole point of the thing.
+Fire 8 of those at once and they join a running batch, sharing one pass over the weights.
+That's the whole point of the thing.
 
 One scheduler thread owns all the model compute; request threads just enqueue and wait on
 a future. This is on purpose. The matmul already fans out across the thread pool, so if
@@ -74,14 +74,13 @@ Two workers behind a coordinator:
 ./build/inferium_coordinator --workers 127.0.0.1:50051,127.0.0.1:50052 --port 9090
 ```
 
-The coordinator round-robins and speaks the same HTTP API, so `curl` doesn't know the
-difference. Kill a worker mid-run and requests keep succeeding — the round-robin cursor
+The coordinator round-robins and speaks the same HTTP API, so `curl` treats it like any
+single node. Kill a worker mid-run and requests keep succeeding — the round-robin cursor
 advances on every retry, so a retry never lands back on the worker that just died. Kill
 both and you get a `503` with the actual gRPC error instead of a hang.
 
-Worth saying plainly: two workers on *one* machine buy you redundancy, not speed. They
-share the same memory bus, and memory is the bottleneck. This only pays off across real
-machines.
+Worth saying plainly: two workers on *one* machine buy you redundancy. They share the same
+memory bus, and memory is the bottleneck, so speed needs separate machines.
 
 ## benchmarks
 
@@ -122,17 +121,16 @@ Run it yourself:
 The interesting finding, and the reason the rest of the design looks the way it does.
 
 Early on, 8 threads gave me a 3.4x speedup. After I added the KV-cache and NEON SIMD, the
-same 8 threads gave 1.43x. Optimizing the compute didn't hit a wall — it *moved the wall
-closer*.
+same 8 threads gave 1.43x. Optimizing the compute *moved the wall closer*.
 
 At batch size 1, decode reads every weight in the model from memory and uses each one for
 exactly one multiply. 1.1B params at 4 bytes is ~4.4GB per token. At ~120 GB/s that's your
-ceiling, and no number of cores changes it. Ten threads is actually slower than eight; the
-efficiency cores add contention without adding bandwidth.
+ceiling, and cores are irrelevant to it. Ten threads is actually slower than eight; the
+efficiency cores add contention while bandwidth stays flat.
 
-Which tells you what batching is for. It doesn't make any matmul faster. It amortizes the
-weight *load* — `mat_mat` pulls one weight vector into a register and fires four FMAs
-against four different sequences, so 8 sequences cost roughly the memory traffic of 2.
+Which tells you what batching is for: it amortizes the weight *load*. `mat_mat` pulls one
+weight vector into a register and fires four FMAs against four different sequences, so 8
+sequences cost roughly the memory traffic of 2.
 That's where the 2.5x comes from.
 
 Gains flatten past batch 4-8 because attention is per-sequence work that batching can't
@@ -147,7 +145,7 @@ share, and every sequence's KV cache is fighting for the same cache lines.
 - Vectorize attention. It's still scalar and rescans the full history every step, which is
   most of why batch gains flatten.
 - Stream tokens back instead of making you wait for the whole completion.
-- Sampling that isn't greedy — temperature, top-k, top-p.
+- Temperature, top-k, and top-p sampling.
 - Share one set of weights across workers on the same box instead of each loading its own.
 
 ## troubleshooting
