@@ -8,78 +8,89 @@
 namespace {
 
 struct Activations {
-    std::vector<float> x_norm, Q, attn_out;
+    float* x_norm;
+    float* Q;
+    float* attn_out;
 
-    Activations(int n_new, const Model& m)
-        : x_norm(n_new * m.embd_dim),
-          Q(n_new * m.q_dim),
-          attn_out(n_new * m.q_dim) {}
+    Activations(Arena& arena, int n_new, const Model& m)
+        : x_norm(arena.alloc_floats((size_t)n_new * m.embd_dim)),
+          Q(arena.alloc_floats((size_t)n_new * m.q_dim)),
+          attn_out(arena.alloc_floats((size_t)n_new * m.q_dim)) {}
 };
 
 void attention_block(const Model& m, const LayerWeights& layer, uint64_t layer_index,
-                     std::vector<float>& input, KVCache& cache, Activations& act,
-                     int n_new, int past_len) {
+                     float* input, KVCache& cache, Activations& act,
+                     int n_new, int past_len, Arena& arena) {
+    for (int t = 0; t < n_new; ++t) {
+        const float* x = input + t * m.embd_dim;
+        float* xn = act.x_norm + t * m.embd_dim;
+        std::copy(x, x + m.embd_dim, xn);
+        rms_norm(xn, layer.attn_norm, m.embd_dim);
+    }
+
     float* k_base = cache.K[layer_index].data();
     float* v_base = cache.V[layer_index].data();
+    float* k_dst = k_base + (size_t)past_len * cache.kv_dim;
+    float* v_dst = v_base + (size_t)past_len * cache.kv_dim;
+
+    mat_mat(layer.Wq.data(), act.x_norm, act.Q, m.q_dim, m.embd_dim, n_new);
+    mat_mat(layer.Wk.data(), act.x_norm, k_dst, m.k_dim, m.embd_dim, n_new);
+    mat_mat(layer.Wv.data(), act.x_norm, v_dst, m.v_dim, m.embd_dim, n_new);
 
     for (int t = 0; t < n_new; ++t) {
         int pos = past_len + t;
-        const float* x = input.data() + t * m.embd_dim;
-        float* xn = act.x_norm.data() + t * m.embd_dim;
-        std::copy(x, x + m.embd_dim, xn);
-        rms_norm(xn, layer.attn_norm, m.embd_dim);
-
-        float* k_dst = k_base + pos * cache.kv_dim;
-        float* v_dst = v_base + pos * cache.kv_dim;
-        mat_vec(layer.Wq.data(), xn, act.Q.data() + t * m.q_dim, m.q_dim, m.embd_dim);
-        mat_vec(layer.Wk.data(), xn, k_dst, m.k_dim, m.embd_dim);
-        mat_vec(layer.Wv.data(), xn, v_dst, m.v_dim, m.embd_dim);
-        rope(act.Q.data() + t * m.q_dim, pos, m.n_heads,    m.head_dim);
-        rope(k_dst, pos, m.n_kv_heads, m.head_dim);
+        rope(act.Q + t * m.q_dim, pos, m.n_heads, m.head_dim);
+        rope(k_dst + (size_t)t * cache.kv_dim, pos, m.n_kv_heads, m.head_dim);
     }
-    attention(act.Q.data(), k_base, v_base, act.attn_out.data(),
+
+    attention(act.Q, k_base, v_base, act.attn_out,
               n_new, past_len, m.n_heads, m.n_kv_heads, m.head_dim);
-    output_projection(act.attn_out.data(), layer.Wo.data(), input.data(),
-                      n_new, m.q_dim, m.embd_dim);
+    output_projection(act.attn_out, layer.Wo.data(), input,
+                      n_new, m.q_dim, m.embd_dim, arena);
 }
 
 void ffn_block(const Model& m, const LayerWeights& layer,
-               std::vector<float>& input, Activations& act, int n_new) {
+               float* input, Activations& act, int n_new, Arena& arena) {
     for (int t = 0; t < n_new; ++t) {
-        const float* x = input.data() + t * m.embd_dim;
-        float* xn = act.x_norm.data() + t * m.embd_dim;
+        const float* x = input + t * m.embd_dim;
+        float* xn = act.x_norm + t * m.embd_dim;
         std::copy(x, x + m.embd_dim, xn);
         rms_norm(xn, layer.ffn_norm, m.embd_dim);
     }
-    feed_forward(act.x_norm.data(), layer.Wgate.data(), layer.Wup.data(), layer.Wdown.data(),
-                 input.data(), n_new, m.embd_dim, m.ffn_dim);
+    feed_forward(act.x_norm, layer.Wgate.data(), layer.Wup.data(), layer.Wdown.data(),
+                 input, n_new, m.embd_dim, m.ffn_dim, arena);
 }
 
-int greedy_next_token(const Model& m, const std::vector<float>& input, int n_new) {
-    std::vector<float> hidden(input.data() + (n_new - 1) * m.embd_dim,
-                              input.data() + n_new * m.embd_dim);
-    rms_norm(hidden.data(), m.final_norm, m.embd_dim);
-
-    std::vector<float> logits(m.vocab_size);
-    mat_vec(m.Wout.data(), hidden.data(), logits.data(), m.vocab_size, m.embd_dim);
-
-    return (int)(std::max_element(logits.begin(), logits.end()) - logits.begin());
 }
 
-std::vector<float> forward(const Model& m, KVCache& cache,
-                           const std::vector<int>& tokens, int past_len) {
+int greedy_next_token(const Model& m, const float* hidden_row, Arena& arena) {
+    ArenaScope scope(arena);
+    float* hidden = arena.alloc_floats(m.embd_dim);
+    float* logits = arena.alloc_floats(m.vocab_size);
+
+    std::copy(hidden_row, hidden_row + m.embd_dim, hidden);
+    rms_norm(hidden, m.final_norm, m.embd_dim);
+    mat_vec(m.Wout.data(), hidden, logits, m.vocab_size, m.embd_dim);
+
+    return (int)(std::max_element(logits, logits + m.vocab_size) - logits);
+}
+
+float* forward(const Model& m, KVCache& cache, const std::vector<int>& tokens,
+               int past_len, Arena& arena) {
     int n_new = (int)tokens.size();
-    std::vector<float> input = embed_tokens(tokens, m.embd_table, m.embd_dim);
-    Activations act(n_new, m);
+    float* input = arena.alloc_floats((size_t)n_new * m.embd_dim);
+    for (int i = 0; i < n_new; ++i) {
+        const float* src = m.embd_table.data() + (size_t)tokens[i] * m.embd_dim;
+        std::copy(src, src + m.embd_dim, input + (size_t)i * m.embd_dim);
+    }
 
+    Activations act(arena, n_new, m);
     for (uint64_t l = 0; l < m.n_layers; ++l) {
         const LayerWeights& layer = m.layers[l];
-        attention_block(m, layer, l, input, cache, act, n_new, past_len);
-        ffn_block(m, layer, input, act, n_new);
+        attention_block(m, layer, l, input, cache, act, n_new, past_len, arena);
+        ffn_block(m, layer, input, act, n_new, arena);
     }
     return input;
-}
-
 }
 
 KVCache::KVCache(const Model& m, int max_seq)
@@ -88,8 +99,17 @@ KVCache::KVCache(const Model& m, int max_seq)
       K(m.n_layers, std::vector<float>(max_seq * m.k_dim)),
       V(m.n_layers, std::vector<float>(max_seq * m.v_dim)) {}
 
+size_t activation_arena_bytes(const Model& m, int max_batch) {
+    size_t per_row = m.embd_dim * 3 + m.q_dim * 2 + m.ffn_dim * 2;
+    size_t rows = (size_t)std::max(max_batch, 1);
+    size_t floats = rows * per_row + m.vocab_size + m.embd_dim;
+    return (floats + 4096) * sizeof(float) * 2;
+}
+
 Session::Session(const Model& model, int max_seq)
-    : model_(model), cache_(model, max_seq) {}
+    : model_(model),
+      cache_(model, max_seq),
+      arena_(activation_arena_bytes(model, kMaxPrefillChunk)) {}
 
 int Session::advance(const std::vector<int>& new_tokens) {
     int n_new = (int)new_tokens.size();
@@ -97,8 +117,17 @@ int Session::advance(const std::vector<int>& new_tokens) {
         throw std::runtime_error("KV cache overflow: sequence exceeds max_seq");
     }
 
-    std::vector<float> hidden = forward(model_, cache_, new_tokens, past_len_);
-    int next = greedy_next_token(model_, hidden, n_new);
-    past_len_ += n_new;
+    int next = 0;
+    for (int offset = 0; offset < n_new; offset += kMaxPrefillChunk) {
+        int chunk_len = std::min(kMaxPrefillChunk, n_new - offset);
+        std::vector<int> chunk(new_tokens.begin() + offset,
+                               new_tokens.begin() + offset + chunk_len);
+
+        arena_.reset();
+        float* hidden = forward(model_, cache_, chunk, past_len_, arena_);
+        next = greedy_next_token(
+            model_, hidden + (size_t)(chunk_len - 1) * model_.embd_dim, arena_);
+        past_len_ += chunk_len;
+    }
     return next;
 }

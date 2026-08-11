@@ -1,6 +1,8 @@
 #pragma once
 #include <vector>
 
+#include "arena.hpp"
+
 void set_num_threads(int n);
 
 std::vector<float> embed_tokens(
@@ -12,6 +14,8 @@ void rms_norm(float* x, const float* weight, int n, float eps = 1e-5f);
 
 void mat_vec(const float* W, const float* x, float* out, int out_dim, int in_dim);
 
+void mat_mat(const float* W, const float* X, float* out, int out_dim, int in_dim, int batch);
+
 void rope(float* x, int pos, int n_heads, int head_dim, float theta_base = 10000.0f);
 
 void attention(
@@ -20,8 +24,8 @@ void attention(
 
 void output_projection(
     const float* attn_out, const float* Wo, float* x,
-    int seq_len, int attn_dim, int embd_dim);
+    int seq_len, int attn_dim, int embd_dim, Arena& arena);
 
 void feed_forward(
     const float* x_norm, const float* Wgate, const float* Wup, const float* Wdown,
-    float* x, int seq_len, int embd_dim, int ffn_dim);
+    float* x, int seq_len, int embd_dim, int ffn_dim, Arena& arena);

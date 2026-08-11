@@ -121,6 +121,61 @@ void mat_vec(const float* W, const float* x, float* out, int out_dim, int in_dim
     });
 }
 
+// One weight vector load feeds four FMAs, so batched decode reads the weights
+// from memory once per four rows instead of once per row.
+static void dot_x4(const float* w, const float* x0, const float* x1,
+                   const float* x2, const float* x3, int n, float* out)
+{
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    float32x4_t acc2 = vdupq_n_f32(0.0f);
+    float32x4_t acc3 = vdupq_n_f32(0.0f);
+
+    int j = 0;
+    for (; j + 4 <= n; j += 4) {
+        float32x4_t wv = vld1q_f32(w + j);
+        acc0 = vfmaq_f32(acc0, wv, vld1q_f32(x0 + j));
+        acc1 = vfmaq_f32(acc1, wv, vld1q_f32(x1 + j));
+        acc2 = vfmaq_f32(acc2, wv, vld1q_f32(x2 + j));
+        acc3 = vfmaq_f32(acc3, wv, vld1q_f32(x3 + j));
+    }
+
+    float s0 = vaddvq_f32(acc0), s1 = vaddvq_f32(acc1);
+    float s2 = vaddvq_f32(acc2), s3 = vaddvq_f32(acc3);
+    for (; j < n; ++j) {
+        s0 += w[j] * x0[j];
+        s1 += w[j] * x1[j];
+        s2 += w[j] * x2[j];
+        s3 += w[j] * x3[j];
+    }
+    out[0] = s0;
+    out[1] = s1;
+    out[2] = s2;
+    out[3] = s3;
+}
+
+void mat_mat(const float* W, const float* X, float* out,
+             int out_dim, int in_dim, int batch)
+{
+    parallel_for(out_dim, [&](int start, int end) {
+        float lanes[4];
+        for (int i = start; i < end; ++i) {
+            const float* w_row = W + (size_t)i * in_dim;
+            int b = 0;
+            for (; b + 4 <= batch; b += 4) {
+                dot_x4(w_row,
+                       X + (size_t)(b + 0) * in_dim, X + (size_t)(b + 1) * in_dim,
+                       X + (size_t)(b + 2) * in_dim, X + (size_t)(b + 3) * in_dim,
+                       in_dim, lanes);
+                for (int k = 0; k < 4; ++k)
+                    out[(size_t)(b + k) * out_dim + i] = lanes[k];
+            }
+            for (; b < batch; ++b)
+                out[(size_t)b * out_dim + i] = dot(w_row, X + (size_t)b * in_dim, in_dim);
+        }
+    });
+}
+
 void rope(float* x, int pos, int n_heads, int head_dim, float theta_base)
 {
     for (int h = 0; h < n_heads; ++h) {
@@ -188,15 +243,14 @@ void attention(
 
 void output_projection(
     const float* attn_out, const float* Wo, float* x,
-    int seq_len, int attn_dim, int embd_dim)
+    int seq_len, int attn_dim, int embd_dim, Arena& arena)
 {
-    std::vector<float> proj(embd_dim);
-    for (int t = 0; t < seq_len; ++t) {
-        mat_vec(Wo, attn_out + t * attn_dim, proj.data(), embd_dim, attn_dim);
-        float* row = x + t * embd_dim;
-        for (int i = 0; i < embd_dim; ++i)
-            row[i] += proj[i];
-    }
+    ArenaScope scope(arena);
+    float* proj = arena.alloc_floats((size_t)seq_len * embd_dim);
+
+    mat_mat(Wo, attn_out, proj, embd_dim, attn_dim, seq_len);
+    for (int i = 0; i < seq_len * embd_dim; ++i)
+        x[i] += proj[i];
 }
 
 static float silu(float x)
@@ -206,23 +260,20 @@ static float silu(float x)
 
 void feed_forward(
     const float* x_norm, const float* Wgate, const float* Wup, const float* Wdown,
-    float* x, int seq_len, int embd_dim, int ffn_dim)
+    float* x, int seq_len, int embd_dim, int ffn_dim, Arena& arena)
 {
-    std::vector<float> gate(ffn_dim);
-    std::vector<float> up(ffn_dim);
-    std::vector<float> proj(embd_dim);
+    ArenaScope scope(arena);
+    float* gate = arena.alloc_floats((size_t)seq_len * ffn_dim);
+    float* up   = arena.alloc_floats((size_t)seq_len * ffn_dim);
+    float* proj = arena.alloc_floats((size_t)seq_len * embd_dim);
 
-    for (int t = 0; t < seq_len; ++t) {
-        const float* in = x_norm + t * embd_dim;
-        mat_vec(Wgate, in, gate.data(), ffn_dim, embd_dim);
-        mat_vec(Wup,   in, up.data(),   ffn_dim, embd_dim);
+    mat_mat(Wgate, x_norm, gate, ffn_dim, embd_dim, seq_len);
+    mat_mat(Wup,   x_norm, up,   ffn_dim, embd_dim, seq_len);
 
-        for (int i = 0; i < ffn_dim; ++i)
-            gate[i] = silu(gate[i]) * up[i];
+    for (int i = 0; i < seq_len * ffn_dim; ++i)
+        gate[i] = silu(gate[i]) * up[i];
 
-        mat_vec(Wdown, gate.data(), proj.data(), embd_dim, ffn_dim);
-        float* row = x + t * embd_dim;
-        for (int i = 0; i < embd_dim; ++i)
-            row[i] += proj[i];
-    }
+    mat_mat(Wdown, gate, proj, embd_dim, ffn_dim, seq_len);
+    for (int i = 0; i < seq_len * embd_dim; ++i)
+        x[i] += proj[i];
 }
