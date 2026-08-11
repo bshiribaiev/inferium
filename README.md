@@ -1,11 +1,16 @@
 # inferium
 
-A CPU inference engine for Llama-style LLMs.
+Run LLMs on your own machine, serve them over HTTP, and spread requests across several
+nodes.
 
-It implements GGUF parsing, `Q4_K`/`Q6_K` dequantization, RMSNorm, RoPE, grouped-query
-attention, SwiGLU, and greedy sampling on the standard library and ARM NEON intrinsics.
-It `mmap`s the model file, serves requests over HTTP with continuous batching, and spreads
-them across worker nodes over gRPC.
+It implements the whole path itself — GGUF parsing, quantized weights, the transformer
+forward pass — but the interesting part is what makes it fast: a KV-cache, NEON SIMD
+matmuls, an arena allocator, and continuous batching so concurrent requests share one pass
+over the weights. Efficiency notes covers where the time actually goes; it turned out to
+be memory bandwidth rather than cores.
+
+Today that means Llama-architecture models in `Q4_K`/`Q6_K`, tested against TinyLlama-1.1B.
+Broader architecture support is on the todo list.
 
 ## install
 
@@ -137,6 +142,9 @@ share, and every sequence's KV cache is fighting for the same cache lines.
 - Vectorize attention. It's still scalar and rescans the full history every step, which is
   most of why batch gains flatten.
 - Stream tokens back as they are generated.
+- More architectures. `general.architecture` is already parsed out of the GGUF and unused,
+  so that is the seam. Llama-family variants need QKV bias support and more quant formats;
+  GPT-2 and Falcon additionally need LayerNorm, a non-gated GELU MLP, and byte-level BPE.
 - Temperature, top-k, and top-p sampling.
 - Share one set of weights across workers on the same box instead of each loading its own.
 
