@@ -75,6 +75,93 @@ int greedy_next_token(const Model& m, const float* hidden_row, Arena& arena) {
     return (int)(std::max_element(logits, logits + m.vocab_size) - logits);
 }
 
+void greedy_next_tokens(const Model& m, const float* hidden_rows, int batch,
+                        Arena& arena, std::vector<int>& out) {
+    ArenaScope scope(arena);
+    float* normed = arena.alloc_floats((size_t)batch * m.embd_dim);
+    float* logits = arena.alloc_floats((size_t)batch * m.vocab_size);
+
+    for (int b = 0; b < batch; ++b) {
+        const float* src = hidden_rows + (size_t)b * m.embd_dim;
+        float* dst = normed + (size_t)b * m.embd_dim;
+        std::copy(src, src + m.embd_dim, dst);
+        rms_norm(dst, m.final_norm, m.embd_dim);
+    }
+
+    mat_mat(m.Wout.data(), normed, logits, m.vocab_size, m.embd_dim, batch);
+
+    out.resize(batch);
+    for (int b = 0; b < batch; ++b) {
+        const float* row = logits + (size_t)b * m.vocab_size;
+        out[b] = (int)(std::max_element(row, row + m.vocab_size) - row);
+    }
+}
+
+void decode_batch(const Model& m, const std::vector<DecodeSlot>& slots,
+                  Arena& arena, std::vector<int>& next_tokens) {
+    int batch = (int)slots.size();
+    float* input = arena.alloc_floats((size_t)batch * m.embd_dim);
+    for (int b = 0; b < batch; ++b) {
+        const float* src = m.embd_table.data() + (size_t)slots[b].token * m.embd_dim;
+        std::copy(src, src + m.embd_dim, input + (size_t)b * m.embd_dim);
+    }
+
+    Activations act(arena, batch, m);
+    float* K_step = arena.alloc_floats((size_t)batch * m.k_dim);
+    float* V_step = arena.alloc_floats((size_t)batch * m.v_dim);
+
+    for (uint64_t l = 0; l < m.n_layers; ++l) {
+        const LayerWeights& layer = m.layers[l];
+
+        for (int b = 0; b < batch; ++b) {
+            const float* x = input + (size_t)b * m.embd_dim;
+            float* xn = act.x_norm + (size_t)b * m.embd_dim;
+            std::copy(x, x + m.embd_dim, xn);
+            rms_norm(xn, layer.attn_norm, m.embd_dim);
+        }
+
+        mat_mat(layer.Wq.data(), act.x_norm, act.Q, m.q_dim, m.embd_dim, batch);
+        mat_mat(layer.Wk.data(), act.x_norm, K_step, m.k_dim, m.embd_dim, batch);
+        mat_mat(layer.Wv.data(), act.x_norm, V_step, m.v_dim, m.embd_dim, batch);
+
+        for (int b = 0; b < batch; ++b) {
+            KVCache& cache = *slots[b].cache;
+            int pos = slots[b].pos;
+            float* k_src = K_step + (size_t)b * m.k_dim;
+            float* v_src = V_step + (size_t)b * m.v_dim;
+
+            rope(act.Q + (size_t)b * m.q_dim, pos, m.n_heads, m.head_dim);
+            rope(k_src, pos, m.n_kv_heads, m.head_dim);
+
+            std::copy(k_src, k_src + m.k_dim,
+                      cache.K[l].data() + (size_t)pos * cache.kv_dim);
+            std::copy(v_src, v_src + m.v_dim,
+                      cache.V[l].data() + (size_t)pos * cache.kv_dim);
+        }
+
+        for (int b = 0; b < batch; ++b) {
+            KVCache& cache = *slots[b].cache;
+            attention(act.Q + (size_t)b * m.q_dim, cache.K[l].data(), cache.V[l].data(),
+                      act.attn_out + (size_t)b * m.q_dim,
+                      1, slots[b].pos, m.n_heads, m.n_kv_heads, m.head_dim);
+        }
+
+        output_projection(act.attn_out, layer.Wo.data(), input,
+                          batch, m.q_dim, m.embd_dim, arena);
+
+        for (int b = 0; b < batch; ++b) {
+            const float* x = input + (size_t)b * m.embd_dim;
+            float* xn = act.x_norm + (size_t)b * m.embd_dim;
+            std::copy(x, x + m.embd_dim, xn);
+            rms_norm(xn, layer.ffn_norm, m.embd_dim);
+        }
+        feed_forward(act.x_norm, layer.Wgate.data(), layer.Wup.data(), layer.Wdown.data(),
+                     input, batch, m.embd_dim, m.ffn_dim, arena);
+    }
+
+    greedy_next_tokens(m, input, batch, arena, next_tokens);
+}
+
 float* forward(const Model& m, KVCache& cache, const std::vector<int>& tokens,
                int past_len, Arena& arena) {
     int n_new = (int)tokens.size();
@@ -99,17 +186,18 @@ KVCache::KVCache(const Model& m, int max_seq)
       K(m.n_layers, std::vector<float>(max_seq * m.k_dim)),
       V(m.n_layers, std::vector<float>(max_seq * m.v_dim)) {}
 
-size_t activation_arena_bytes(const Model& m, int max_batch) {
+size_t activation_arena_bytes(const Model& m, int max_rows, int max_logit_rows) {
     size_t per_row = m.embd_dim * 3 + m.q_dim * 2 + m.ffn_dim * 2;
-    size_t rows = (size_t)std::max(max_batch, 1);
-    size_t floats = rows * per_row + m.vocab_size + m.embd_dim;
+    size_t rows = (size_t)std::max(max_rows, 1);
+    size_t logit_rows = (size_t)std::max(max_logit_rows, 1);
+    size_t floats = rows * per_row + logit_rows * m.vocab_size + m.embd_dim;
     return (floats + 4096) * sizeof(float) * 2;
 }
 
 Session::Session(const Model& model, int max_seq)
     : model_(model),
       cache_(model, max_seq),
-      arena_(activation_arena_bytes(model, kMaxPrefillChunk)) {}
+      arena_(activation_arena_bytes(model, kMaxPrefillChunk, 1)) {}
 
 int Session::advance(const std::vector<int>& new_tokens) {
     int n_new = (int)new_tokens.size();

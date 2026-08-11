@@ -16,12 +16,24 @@ struct KVCache {
     KVCache(const Model& m, int max_seq);
 };
 
-size_t activation_arena_bytes(const Model& m, int max_batch);
+struct DecodeSlot {
+    int token;
+    int pos;
+    KVCache* cache;
+};
+
+size_t activation_arena_bytes(const Model& m, int max_rows, int max_logit_rows);
 
 float* forward(const Model& m, KVCache& cache, const std::vector<int>& tokens,
                int past_len, Arena& arena);
 
 int greedy_next_token(const Model& m, const float* hidden_row, Arena& arena);
+
+void greedy_next_tokens(const Model& m, const float* hidden_rows, int batch,
+                        Arena& arena, std::vector<int>& out);
+
+void decode_batch(const Model& m, const std::vector<DecodeSlot>& slots,
+                  Arena& arena, std::vector<int>& next_tokens);
 
 class Session {
     public:
