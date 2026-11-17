@@ -28,6 +28,15 @@ add_library(inferium_core STATIC
 target_include_directories(inferium_core PUBLIC src include)
 target_link_libraries(inferium_core PUBLIC Threads::Threads)
 
+if(APPLE)
+    enable_language(OBJCXX)
+    target_sources(inferium_core PRIVATE src/metal_matmul.mm)
+    set_source_files_properties(src/metal_matmul.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    target_link_libraries(inferium_core PUBLIC "-framework Metal" "-framework Foundation")
+else()
+    target_sources(inferium_core PRIVATE src/metal_unavailable.cpp)
+endif()
+
 add_executable(inferium src/main.cpp)
 target_link_libraries(inferium PRIVATE inferium_core)
 

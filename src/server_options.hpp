@@ -8,6 +8,7 @@ struct ServerOptions {
     int max_batch = 8;
     int max_seq = 512;
     int threads = 0;
+    std::string backend = "cpu";
     std::vector<std::string> workers;
     int timeout_ms = 60000;
     int max_retries = 2;

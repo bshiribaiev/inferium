@@ -26,6 +26,7 @@ struct BenchOptions {
     int max_tokens = 32;
     int max_batch = 8;
     int threads = 0;
+    std::string backend = "cpu";
     bool print_output = false;
 };
 
@@ -34,6 +35,13 @@ bool has_flag(int argc, char** argv, const char* name) {
         if (std::strcmp(argv[i], name) == 0) return true;
     }
     return false;
+}
+
+const char* flag_string(int argc, char** argv, const char* name) {
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], name) == 0) return argv[i + 1];
+    }
+    return nullptr;
 }
 
 int flag_value(int argc, char** argv, const char* name, int fallback) {
@@ -51,6 +59,7 @@ BenchOptions parse_options(int argc, char** argv) {
     options.max_tokens  = flag_value(argc, argv, "--max-tokens", options.max_tokens);
     options.max_batch   = flag_value(argc, argv, "--batch", options.max_batch);
     options.threads     = flag_value(argc, argv, "--threads", options.threads);
+    if (const char* backend = flag_string(argc, argv, "--backend")) options.backend = backend;
     options.print_output = has_flag(argc, argv, "--print");
     return options;
 }
@@ -80,12 +89,14 @@ const std::vector<std::string>& prompt_pool() {
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: inferium_bench <model.gguf> [--requests N] [--concurrency N]"
-                     " [--max-tokens N] [--batch N] [--threads N]\n";
+                     " [--max-tokens N] [--batch N] [--threads N]"
+                     " [--backend cpu|metal]\n";
         return 1;
     }
 
     BenchOptions options = parse_options(argc, argv);
     if (options.threads > 0) set_num_threads(options.threads);
+    set_backend(parse_backend(options.backend));
 
     MappedFile model_file(options.model_path);
     const uint8_t* base = static_cast<const uint8_t*>(model_file.data());

@@ -11,12 +11,14 @@
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: inferium_server <model.gguf> [--port N] [--batch N]"
-                     " [--max-seq N] [--threads N]\n";
+                     " [--max-seq N] [--threads N]"
+                     " [--backend cpu|metal]\n";
         return 1;
     }
 
     ServerOptions options = parse_server_options(argc, argv);
     if (options.threads > 0) set_num_threads(options.threads);
+    set_backend(parse_backend(options.backend));
 
     LoadedModel loaded(argv[1]);
 

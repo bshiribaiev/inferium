@@ -1,9 +1,16 @@
 #pragma once
 
+#include <string>
+
 #include "arena.hpp"
 #include "packed_matrix.hpp"
 
 void set_num_threads(int n);
+
+enum class Backend { Cpu, Metal };
+
+Backend parse_backend(const std::string& name);
+void set_backend(Backend backend);
 
 void rms_norm(float* x, const float* weight, int n, float eps = 1e-5f);
 

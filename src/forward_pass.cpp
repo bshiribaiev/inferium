@@ -1,10 +1,12 @@
 #include "forward_pass.hpp"
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 #include <arm_neon.h>
 
+#include "metal_matmul.hpp"
 #include "worker_team.hpp"
 
 void rms_norm(float* x, const float* weight, int n, float eps)
@@ -29,6 +31,22 @@ static unsigned resolve_thread_count()
     if (g_num_threads > 0)
         return (unsigned)g_num_threads;
     return std::max(1u, std::thread::hardware_concurrency());
+}
+
+static Backend g_backend = Backend::Cpu;
+
+Backend parse_backend(const std::string& name)
+{
+    if (name == "cpu") return Backend::Cpu;
+    if (name == "metal") return Backend::Metal;
+    throw std::runtime_error("unknown backend '" + name + "', expected cpu or metal");
+}
+
+void set_backend(Backend backend)
+{
+    if (backend == Backend::Metal && !metal_is_available())
+        throw std::runtime_error("the metal backend needs a Metal-capable GPU");
+    g_backend = backend;
 }
 
 static WorkerTeam& worker_team()
@@ -128,7 +146,7 @@ static void multiply_panel_int8(const int8_t* panel, const __fp16* panel_scales,
             vst1q_f32(out + (size_t)r * out_dim + first_row + 4 * q, sums[r][q]);
 }
 
-void multiply_weights_by_batch(const PackedMatrix& W, const float* X, float* out, int batch)
+static void multiply_on_cpu(const PackedMatrix& W, const float* X, float* out, int batch)
 {
     thread_local std::vector<int8_t> x_values_buffer;
     thread_local std::vector<float> x_scales_buffer;
@@ -155,6 +173,15 @@ void multiply_weights_by_batch(const PackedMatrix& W, const float* X, float* out
             if (batch - b == 1) multiply_panel_int8<1>(panel, panel_scales, W.cols, x_rest, scales_rest, out_rest, W.rows, first_row);
         }
     });
+}
+
+void multiply_weights_by_batch(const PackedMatrix& W, const float* X, float* out, int batch)
+{
+    if (g_backend == Backend::Metal) {
+        metal_multiply_weights_by_batch(W, X, out, batch);
+        return;
+    }
+    multiply_on_cpu(W, X, out, batch);
 }
 
 void rope(float* x, int pos, int n_heads, int head_dim, float theta_base)

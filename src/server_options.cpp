@@ -37,6 +37,7 @@ ServerOptions parse_server_options(int argc, char** argv) {
     options.max_batch   = flag_int(argc, argv, "--batch", options.max_batch);
     options.max_seq     = flag_int(argc, argv, "--max-seq", options.max_seq);
     options.threads     = flag_int(argc, argv, "--threads", options.threads);
+    if (const char* backend = flag_string(argc, argv, "--backend")) options.backend = backend;
     options.timeout_ms  = flag_int(argc, argv, "--timeout-ms", options.timeout_ms);
     options.max_retries = flag_int(argc, argv, "--max-retries", options.max_retries);
     if (const char* workers = flag_string(argc, argv, "--workers")) {

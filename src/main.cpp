@@ -20,6 +20,9 @@ int main(int argc, char** argv) {
     if (const char* threads = std::getenv("INFERIUM_THREADS")) {
         set_num_threads(std::atoi(threads));
     }
+    if (const char* backend = std::getenv("INFERIUM_BACKEND")) {
+        set_backend(parse_backend(backend));
+    }
 
     MappedFile model_file(argv[1]);
     const uint8_t* base = static_cast<const uint8_t*>(model_file.data());
