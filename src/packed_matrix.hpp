@@ -13,8 +13,7 @@ inline size_t round_up_to_page(size_t bytes) {
     return (bytes + kPageBytes - 1) / kPageBytes * kPageBytes;
 }
 
-// Metal can only use memory in place, without copying it, when the allocation starts
-// and ends on a page boundary.
+// Metal can only wrap memory without copying when it starts and ends on a page boundary.
 template <typename T>
 struct PageAlignedAllocator {
     using value_type = T;

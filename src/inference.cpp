@@ -4,6 +4,7 @@
 #include <stdexcept>
 
 #include "forward_pass.hpp"
+#include "metal_backend.hpp"
 
 namespace {
 
@@ -28,8 +29,8 @@ void attention_block(const Model& m, const LayerWeights& layer, uint64_t layer_i
         rms_norm(xn, layer.attn_norm, m.embd_dim);
     }
 
-    float* k_base = cache.K[layer_index].data();
-    float* v_base = cache.V[layer_index].data();
+    float* k_base = cache.K_layer(layer_index);
+    float* v_base = cache.V_layer(layer_index);
     float* k_dst = k_base + (size_t)past_len * cache.kv_dim;
     float* v_dst = v_base + (size_t)past_len * cache.kv_dim;
 
@@ -58,8 +59,6 @@ void ffn_block(const Model& m, const LayerWeights& layer,
     }
     feed_forward(act.x_norm, layer.Wgate, layer.Wup, layer.Wdown,
                  input, n_new, m.embd_dim, m.ffn_dim, arena);
-}
-
 }
 
 int greedy_next_token(const Model& m, const float* hidden_row, Arena& arena) {
@@ -96,8 +95,8 @@ void greedy_next_tokens(const Model& m, const float* hidden_rows, int batch,
     }
 }
 
-void decode_batch(const Model& m, const std::vector<DecodeSlot>& slots,
-                  Arena& arena, std::vector<int>& next_tokens) {
+void decode_on_cpu(const Model& m, const std::vector<DecodeSlot>& slots,
+                   Arena& arena, std::vector<int>& next_tokens) {
     int batch = (int)slots.size();
     float* input = arena.alloc_floats((size_t)batch * m.embd_dim);
     for (int b = 0; b < batch; ++b) {
@@ -132,15 +131,13 @@ void decode_batch(const Model& m, const std::vector<DecodeSlot>& slots,
             rope(act.Q + (size_t)b * m.q_dim, pos, m.n_heads, m.head_dim);
             rope(k_src, pos, m.n_kv_heads, m.head_dim);
 
-            std::copy(k_src, k_src + m.k_dim,
-                      cache.K[l].data() + (size_t)pos * cache.kv_dim);
-            std::copy(v_src, v_src + m.v_dim,
-                      cache.V[l].data() + (size_t)pos * cache.kv_dim);
+            std::copy(k_src, k_src + m.k_dim, cache.K_layer(l) + (size_t)pos * cache.kv_dim);
+            std::copy(v_src, v_src + m.v_dim, cache.V_layer(l) + (size_t)pos * cache.kv_dim);
         }
 
         for (int b = 0; b < batch; ++b) {
             KVCache& cache = *slots[b].cache;
-            attention(act.Q + (size_t)b * m.q_dim, cache.K[l].data(), cache.V[l].data(),
+            attention(act.Q + (size_t)b * m.q_dim, cache.K_layer(l), cache.V_layer(l),
                       act.attn_out + (size_t)b * m.q_dim,
                       1, slots[b].pos, m.n_heads, m.n_kv_heads, m.head_dim);
         }
@@ -178,11 +175,37 @@ float* forward(const Model& m, KVCache& cache, const std::vector<int>& tokens,
     return input;
 }
 
+}
+
+void decode_batch(const Model& m, const std::vector<DecodeSlot>& slots,
+                  Arena& arena, std::vector<int>& next_tokens) {
+    if (current_backend() == Backend::Metal) {
+        metal_decode_batch(m, slots, next_tokens);
+        return;
+    }
+    decode_on_cpu(m, slots, arena, next_tokens);
+}
+
+int prefill_chunk(const Model& m, KVCache& cache, const std::vector<int>& tokens,
+                  int past_len, Arena& arena) {
+    if (current_backend() == Backend::Metal)
+        return metal_prefill_chunk(m, cache, tokens, past_len);
+
+    arena.reset();
+    float* hidden = forward(m, cache, tokens, past_len, arena);
+    int last_row = (int)tokens.size() - 1;
+    return greedy_next_token(m, hidden + (size_t)last_row * m.embd_dim, arena);
+}
+
 KVCache::KVCache(const Model& m, int max_seq)
     : max_seq(max_seq),
       kv_dim(m.k_dim),
-      K(m.n_layers, std::vector<float>(max_seq * m.k_dim)),
-      V(m.n_layers, std::vector<float>(max_seq * m.v_dim)) {}
+      K((size_t)m.n_layers * max_seq * m.k_dim),
+      V((size_t)m.n_layers * max_seq * m.k_dim) {}
+
+KVCache::~KVCache() {
+    metal_forget_cache(*this);
+}
 
 size_t activation_arena_bytes(const Model& m, int max_rows, int max_logit_rows) {
     size_t per_row = m.embd_dim * 3 + m.q_dim * 2 + m.ffn_dim * 2;
@@ -209,10 +232,7 @@ int Session::advance(const std::vector<int>& new_tokens) {
         std::vector<int> chunk(new_tokens.begin() + offset,
                                new_tokens.begin() + offset + chunk_len);
 
-        arena_.reset();
-        float* hidden = forward(model_, cache_, chunk, past_len_, arena_);
-        next = greedy_next_token(
-            model_, hidden + (size_t)(chunk_len - 1) * model_.embd_dim, arena_);
+        next = prefill_chunk(model_, cache_, chunk, past_len_, arena_);
         past_len_ += chunk_len;
     }
     return next;

@@ -1,11 +1,17 @@
-#include "metal_matmul.hpp"
+#include "metal_backend.hpp"
 
 #include <stdexcept>
 
-bool metal_is_available() {
-    return false;
-}
-
-void metal_multiply_weights_by_batch(const PackedMatrix&, const float*, float*, int) {
+void metal_initialize() {
     throw std::runtime_error("this build has no Metal backend");
 }
+
+int metal_prefill_chunk(const Model&, KVCache&, const std::vector<int>&, int) {
+    throw std::runtime_error("this build has no Metal backend");
+}
+
+void metal_decode_batch(const Model&, const std::vector<DecodeSlot>&, std::vector<int>&) {
+    throw std::runtime_error("this build has no Metal backend");
+}
+
+void metal_forget_cache(const KVCache&) {}

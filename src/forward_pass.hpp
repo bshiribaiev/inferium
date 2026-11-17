@@ -11,6 +11,7 @@ enum class Backend { Cpu, Metal };
 
 Backend parse_backend(const std::string& name);
 void set_backend(Backend backend);
+Backend current_backend();
 
 void rms_norm(float* x, const float* weight, int n, float eps = 1e-5f);
 

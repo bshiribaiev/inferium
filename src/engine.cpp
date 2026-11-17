@@ -112,10 +112,7 @@ int InferenceEngine::prefill(Sequence& seq) {
         std::vector<int> chunk(seq.tokens.begin() + offset,
                                seq.tokens.begin() + offset + len);
 
-        arena_.reset();
-        float* hidden = forward(model_, *seq.cache, chunk, seq.past_len, arena_);
-        next = greedy_next_token(model_, hidden + (size_t)(len - 1) * model_.embd_dim,
-                                 arena_);
+        next = prefill_chunk(model_, *seq.cache, chunk, seq.past_len, arena_);
         seq.past_len += len;
     }
     return next;

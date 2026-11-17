@@ -7,13 +7,25 @@
 
 constexpr int kMaxPrefillChunk = 256;
 
+// One page-aligned [layer][position][kv_dim] block, so the Metal backend uses it without copying.
 struct KVCache {
     int max_seq;
     int64_t kv_dim;
-    std::vector<std::vector<float>> K;
-    std::vector<std::vector<float>> V;
+    std::vector<float, PageAlignedAllocator<float>> K;
+    std::vector<float, PageAlignedAllocator<float>> V;
 
     KVCache(const Model& m, int max_seq);
+    ~KVCache();
+
+    float* K_layer(uint64_t layer) {
+        return K.data() + layer * max_seq * kv_dim;
+    }
+    float* V_layer(uint64_t layer) {
+        return V.data() + layer * max_seq * kv_dim;
+    }
+
+    KVCache(const KVCache&) = delete;
+    KVCache& operator= (const KVCache&) = delete;
 };
 
 struct DecodeSlot {
@@ -24,13 +36,8 @@ struct DecodeSlot {
 
 size_t activation_arena_bytes(const Model& m, int max_rows, int max_logit_rows);
 
-float* forward(const Model& m, KVCache& cache, const std::vector<int>& tokens,
-               int past_len, Arena& arena);
-
-int greedy_next_token(const Model& m, const float* hidden_row, Arena& arena);
-
-void greedy_next_tokens(const Model& m, const float* hidden_rows, int batch,
-                        Arena& arena, std::vector<int>& out);
+int prefill_chunk(const Model& m, KVCache& cache, const std::vector<int>& tokens,
+                  int past_len, Arena& arena);
 
 void decode_batch(const Model& m, const std::vector<DecodeSlot>& slots,
                   Arena& arena, std::vector<int>& next_tokens);
