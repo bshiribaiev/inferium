@@ -80,47 +80,105 @@ static bool cpu_has_sme2()
     return available;
 }
 
+static void quantize_rows(const float* X, int rows, int cols,
+                          std::vector<int8_t>& values, std::vector<float>& scales)
+{
+    const int n_blocks = cols / kQuantBlock;
+    values.resize((size_t)rows * cols);
+    scales.resize((size_t)rows * n_blocks);
+    for (int i = 0; i < rows * n_blocks; ++i) {
+        const float* src = X + (size_t)i * kQuantBlock;
+        float max_abs = 0.0f;
+        for (int k = 0; k < kQuantBlock; ++k)
+            max_abs = std::max(max_abs, std::fabs(src[k]));
+
+        float scale = max_abs / 127.0f;
+        float inverse_scale = scale != 0 ? 1.0f / scale : 0.0f;
+        scales[i] = scale;
+        for (int k = 0; k < kQuantBlock; ++k)
+            values[(size_t)i * kQuantBlock + k] = (int8_t)std::lround(src[k] * inverse_scale);
+    }
+}
+
+template <int kLane>
+static inline void dot_four_columns(const int8_t* w, int8x16_t x, int32x4_t acc[4])
+{
+    acc[0] = vdotq_laneq_s32(acc[0], vld1q_s8(w),      x, kLane);
+    acc[1] = vdotq_laneq_s32(acc[1], vld1q_s8(w + 16), x, kLane);
+    acc[2] = vdotq_laneq_s32(acc[2], vld1q_s8(w + 32), x, kLane);
+    acc[3] = vdotq_laneq_s32(acc[3], vld1q_s8(w + 48), x, kLane);
+}
+
+static inline void dot_quant_block(const int8_t* w, const int8_t* x, int32x4_t acc[4])
+{
+    int8x16_t x_low = vld1q_s8(x);
+    int8x16_t x_high = vld1q_s8(x + 16);
+    dot_four_columns<0>(w + 0 * 64, x_low, acc);
+    dot_four_columns<1>(w + 1 * 64, x_low, acc);
+    dot_four_columns<2>(w + 2 * 64, x_low, acc);
+    dot_four_columns<3>(w + 3 * 64, x_low, acc);
+    dot_four_columns<0>(w + 4 * 64, x_high, acc);
+    dot_four_columns<1>(w + 5 * 64, x_high, acc);
+    dot_four_columns<2>(w + 6 * 64, x_high, acc);
+    dot_four_columns<3>(w + 7 * 64, x_high, acc);
+}
+
 template <int kBatchRows>
-static void multiply_panel_neon(const __fp16* panel, int cols, const float* X,
+static void multiply_panel_int8(const int8_t* panel, const __fp16* panel_scales, int cols,
+                                const int8_t* x_values, const float* x_scales,
                                 float* out, int out_dim, int first_row)
 {
-    float32x4_t acc[kBatchRows][4] = {};
-    for (int k = 0; k < cols; ++k) {
-        const __fp16* w = panel + (size_t)k * kPanelRows;
-        float16x8_t low = vld1q_f16(w);
-        float16x8_t high = vld1q_f16(w + 8);
-        float32x4_t w0 = vcvt_f32_f16(vget_low_f16(low));
-        float32x4_t w1 = vcvt_high_f32_f16(low);
-        float32x4_t w2 = vcvt_f32_f16(vget_low_f16(high));
-        float32x4_t w3 = vcvt_high_f32_f16(high);
+    const int n_blocks = cols / kQuantBlock;
+    float32x4_t sums[kBatchRows][4] = {};
+
+    for (int block = 0; block < n_blocks; ++block) {
+        const int8_t* w = panel + (size_t)block * kQuantBlock * kPanelRows;
+        float16x8_t scales_low = vld1q_f16(panel_scales + block * kPanelRows);
+        float16x8_t scales_high = vld1q_f16(panel_scales + block * kPanelRows + 8);
+        float32x4_t w_scales[4] = {
+            vcvt_f32_f16(vget_low_f16(scales_low)), vcvt_high_f32_f16(scales_low),
+            vcvt_f32_f16(vget_low_f16(scales_high)), vcvt_high_f32_f16(scales_high),
+        };
+
         for (int r = 0; r < kBatchRows; ++r) {
-            float x = X[(size_t)r * cols + k];
-            acc[r][0] = vfmaq_n_f32(acc[r][0], w0, x);
-            acc[r][1] = vfmaq_n_f32(acc[r][1], w1, x);
-            acc[r][2] = vfmaq_n_f32(acc[r][2], w2, x);
-            acc[r][3] = vfmaq_n_f32(acc[r][3], w3, x);
+            int32x4_t acc[4] = {};
+            dot_quant_block(w, x_values + (size_t)r * cols + block * kQuantBlock, acc);
+            float x_scale = x_scales[(size_t)r * n_blocks + block];
+            for (int q = 0; q < 4; ++q)
+                sums[r][q] = vfmaq_f32(sums[r][q], vcvtq_f32_s32(acc[q]),
+                                       vmulq_n_f32(w_scales[q], x_scale));
         }
     }
     for (int r = 0; r < kBatchRows; ++r)
         for (int q = 0; q < 4; ++q)
-            vst1q_f32(out + (size_t)r * out_dim + first_row + 4 * q, acc[r][q]);
+            vst1q_f32(out + (size_t)r * out_dim + first_row + 4 * q, sums[r][q]);
 }
 
-static void multiply_with_neon(const PackedMatrix& W, const float* X, float* out, int batch)
+static void multiply_with_int8(const PackedMatrix& W, const float* X, float* out, int batch)
 {
+    thread_local std::vector<int8_t> x_values_buffer;
+    thread_local std::vector<float> x_scales_buffer;
+    quantize_rows(X, batch, W.cols, x_values_buffer, x_scales_buffer);
+    const int8_t* x_values = x_values_buffer.data();
+    const float* x_scales = x_scales_buffer.data();
+    const int n_blocks = W.cols / kQuantBlock;
+
     split_range_across_threads(W.rows / kPanelRows, [&](int start, int end) {
         for (int p = start; p < end; ++p) {
-            const __fp16* panel = W.panel(p);
+            const int8_t* panel = W.int8_panel(p);
+            const __fp16* panel_scales = W.int8_panel_scales(p);
             int first_row = p * kPanelRows;
             int b = 0;
             for (; b + 4 <= batch; b += 4)
-                multiply_panel_neon<4>(panel, W.cols, X + (size_t)b * W.cols,
+                multiply_panel_int8<4>(panel, panel_scales, W.cols,
+                                       x_values + (size_t)b * W.cols, x_scales + (size_t)b * n_blocks,
                                        out + (size_t)b * W.rows, W.rows, first_row);
-            const float* x_rest = X + (size_t)b * W.cols;
+            const int8_t* x_rest = x_values + (size_t)b * W.cols;
+            const float* scales_rest = x_scales + (size_t)b * n_blocks;
             float* out_rest = out + (size_t)b * W.rows;
-            if (batch - b == 3) multiply_panel_neon<3>(panel, W.cols, x_rest, out_rest, W.rows, first_row);
-            if (batch - b == 2) multiply_panel_neon<2>(panel, W.cols, x_rest, out_rest, W.rows, first_row);
-            if (batch - b == 1) multiply_panel_neon<1>(panel, W.cols, x_rest, out_rest, W.rows, first_row);
+            if (batch - b == 3) multiply_panel_int8<3>(panel, panel_scales, W.cols, x_rest, scales_rest, out_rest, W.rows, first_row);
+            if (batch - b == 2) multiply_panel_int8<2>(panel, panel_scales, W.cols, x_rest, scales_rest, out_rest, W.rows, first_row);
+            if (batch - b == 1) multiply_panel_int8<1>(panel, panel_scales, W.cols, x_rest, scales_rest, out_rest, W.rows, first_row);
         }
     });
 }
@@ -141,7 +199,7 @@ static void multiply_with_sme(const PackedMatrix& W, const float* X, float* out,
 {
     thread_local std::vector<float> packed_batch;
     pack_batch_into_groups(X, W.cols, batch, packed_batch);
-    const __fp16* panels = W.values.data();
+    const __fp16* panels = W.f16_values.data();
     const float* batch_values = packed_batch.data();
     split_range_across_threads(W.rows / kBlockRows, [&](int start, int end) {
         sme_multiply_blocks(panels, W.cols, batch_values, batch, out, W.rows, start, end);
@@ -158,7 +216,7 @@ void multiply_weights_by_batch(const PackedMatrix& W, const float* X, float* out
         multiply_with_sme(W, X, out, batch);
         return;
     }
-    multiply_with_neon(W, X, out, batch);
+    multiply_with_int8(W, X, out, batch);
 }
 
 void rope(float* x, int pos, int n_heads, int head_dim, float theta_base)
