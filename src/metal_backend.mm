@@ -14,9 +14,12 @@ namespace {
 
 constexpr int kSplits = 8;
 constexpr int kNormThreads = 256;
-constexpr int kAttentionThreads = 256;
-constexpr int kMaxPositions = 4096;
 constexpr int kMaxHeadDim = 128;
+constexpr int kMaxThreadsPerThreadgroup = 1024;
+// A decode row has only one threadgroup per KV head, so its positions are split across
+// threadgroups to reach every GPU core; prefill rows already provide that parallelism.
+constexpr int kPositionsPerSplit = 64;
+constexpr int kMaxPositionSplits = 32;
 constexpr int kElementwiseThreads = 256;
 constexpr int kTileRows = 64;
 constexpr int kTileBatch = 32;
@@ -36,8 +39,9 @@ constant int kPanelRows = 16;
 constant int kGroupsPerBlock = 8;
 constant int kBatchPerPass = 8;
 constant int kSplits = 8;
-constant int kMaxPositions = 4096;
+constant int kMaxDimsPerLane = 4;
 constant int kMaxHeadDim = 128;
+constant int kMaxQueryHeadsPerKvHead = 32;
 
 struct MatmulShape {
     int rows;
@@ -57,7 +61,9 @@ struct AttentionShape {
     int q_stride;
     int kv_stride;
     int head_dim;
+    int n_heads;
     int kv_group;
+    int position_splits;
     float scale;
 };
 
@@ -255,18 +261,6 @@ float threadgroup_sum(float value, threadgroup float* scratch, uint lane, uint s
     return total;
 }
 
-float threadgroup_max(float value, threadgroup float* scratch, uint lane, uint simd_id, uint threads)
-{
-    value = simd_max(value);
-    if (lane == 0) scratch[simd_id] = value;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float result = -INFINITY;
-    for (uint s = 0; s < threads / 32; ++s)
-        result = max(result, scratch[s]);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    return result;
-}
-
 kernel void rms_norm_rows(device const float* x [[buffer(0)]],
                           device const float* weight [[buffer(1)]],
                           device float* out [[buffer(2)]],
@@ -323,70 +317,113 @@ kernel void silu_times(device float* gate [[buffer(0)]],
     gate[i] = g / (1.0f + exp(-g)) * up[i];
 }
 
+// One threadgroup per (row, KV head, position split), one simdgroup per query head, so the
+// heads sharing a KV head read each K and V row together. Lanes score 32 positions at once
+// so their loads overlap instead of each position waiting on the last.
 kernel void attention_rows(device const float* q [[buffer(0)]],
                            device const float* K [[buffer(1)]],
                            device const float* V [[buffer(2)]],
                            device float* out [[buffer(3)]],
                            device const int* positions [[buffer(4)]],
                            constant AttentionShape& shape [[buffer(5)]],
-                           uint2 group [[threadgroup_position_in_grid]],
-                           uint2 threadgroup_size [[threads_per_threadgroup]],
-                           uint tid [[thread_index_in_threadgroup]],
+                           device float* partial_max [[buffer(6)]],
+                           device float* partial_sum [[buffer(7)]],
+                           device float* partial_out [[buffer(8)]],
+                           uint3 group [[threadgroup_position_in_grid]],
                            uint lane [[thread_index_in_simdgroup]],
                            uint simd_id [[simdgroup_index_in_threadgroup]])
 {
-    const uint threads = threadgroup_size.x;
-    threadgroup float scores[kMaxPositions];
-    threadgroup float q_head[kMaxHeadDim];
-    threadgroup float partial_out[8 * kMaxHeadDim];
-    threadgroup float scratch[32];
+    threadgroup float q_shared[kMaxQueryHeadsPerKvHead * kMaxHeadDim];
 
-    const int head = group.x;
+    const int kv_head = group.x;
     const int row = group.y;
-    const int kv_offset = (head / shape.kv_group) * shape.head_dim;
+    const int split = group.z;
+    const int head = kv_head * shape.kv_group + simd_id;
+    const int dims_per_lane = shape.head_dim / 32;
     const int n_positions = positions[row] + 1;
+    const int chunk = (n_positions + shape.position_splits - 1) / shape.position_splits;
+    const int begin = split * chunk;
+    const int end = min(n_positions, begin + chunk);
 
+    threadgroup float* q_head = q_shared + simd_id * shape.head_dim;
     device const float* q_row = q + (size_t)row * shape.q_stride + head * shape.head_dim;
-    for (int d = tid; d < shape.head_dim; d += threads)
-        q_head[d] = q_row[d];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int d = lane; d < shape.head_dim; d += 32)
+        q_head[d] = q_row[d] * shape.scale;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
 
-    float local_max = -INFINITY;
-    for (int j = tid; j < n_positions; j += threads) {
-        device const float* k = K + (size_t)j * shape.kv_stride + kv_offset;
-        float dot_product = 0.0f;
-        for (int d = 0; d < shape.head_dim; ++d)
-            dot_product += q_head[d] * k[d];
-        scores[j] = dot_product * shape.scale;
-        local_max = max(local_max, scores[j]);
-    }
-    float row_max = threadgroup_max(local_max, scratch, lane, simd_id, threads);
+    device const float* k_base = K + kv_head * shape.head_dim;
+    device const float* v_base = V + kv_head * shape.head_dim + lane;
+    threadgroup const float4* q_vec = (threadgroup const float4*)q_head;
+    float out_part[kMaxDimsPerLane] = {};
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
 
-    float local_sum = 0.0f;
-    for (int j = tid; j < n_positions; j += threads) {
-        scores[j] = exp(scores[j] - row_max);
-        local_sum += scores[j];
-    }
-    float total = threadgroup_sum(local_sum, scratch, lane, simd_id, threads);
+    for (int base = begin; base < end; base += 32) {
+        const int j = base + lane;
+        const bool valid = j < end;
+        float score = -INFINITY;
+        if (valid) {
+            device const float4* k = (device const float4*)(k_base + (size_t)j * shape.kv_stride);
+            float dot_product = 0.0f;
+            for (int i = 0; i < shape.head_dim / 4; ++i)
+                dot_product += dot(q_vec[i], k[i]);
+            score = dot_product;
+        }
+        float new_max = max(running_max, simd_max(score));
+        float rescale = exp(running_max - new_max);
+        float weight = valid ? exp(score - new_max) : 0.0f;
+        running_sum = running_sum * rescale + simd_sum(weight);
+        running_max = new_max;
 
-    // One output dimension per thread, so neighbouring threads read neighbouring V floats.
-    const int parts = threads / shape.head_dim;
-    const int d = tid % shape.head_dim;
-    const int part = tid / shape.head_dim;
-    if (part < parts) {
-        float acc = 0.0f;
-        for (int j = part; j < n_positions; j += parts)
-            acc += scores[j] * V[(size_t)j * shape.kv_stride + kv_offset + d];
-        partial_out[part * shape.head_dim + d] = acc;
+        for (int i = 0; i < kMaxDimsPerLane; ++i)
+            out_part[i] *= rescale;
+        const int count = min(32, end - base);
+        for (int jj = 0; jj < count; ++jj) {
+            float w = simd_shuffle(weight, jj);
+            device const float* v = v_base + (size_t)(base + jj) * shape.kv_stride;
+            for (int i = 0; i < kMaxDimsPerLane; ++i)
+                if (i < dims_per_lane) out_part[i] += w * v[i * 32];
+        }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if ((int)tid < shape.head_dim) {
-        float o = 0.0f;
-        for (int p = 0; p < parts; ++p)
-            o += partial_out[p * shape.head_dim + tid];
-        out[(size_t)row * shape.q_stride + head * shape.head_dim + tid] = o / total;
+    if (shape.position_splits == 1) {
+        device float* out_row = out + (size_t)row * shape.q_stride + head * shape.head_dim + lane;
+        for (int i = 0; i < dims_per_lane; ++i)
+            out_row[i * 32] = out_part[i] / running_sum;
+        return;
     }
+    size_t slot = ((size_t)row * shape.n_heads + head) * shape.position_splits + split;
+    if (lane == 0) {
+        partial_max[slot] = running_max;
+        partial_sum[slot] = running_sum;
+    }
+    for (int i = 0; i < dims_per_lane; ++i)
+        partial_out[slot * shape.head_dim + lane + i * 32] = out_part[i];
+}
+
+kernel void merge_attention_splits(device const float* partial_max [[buffer(0)]],
+                                   device const float* partial_sum [[buffer(1)]],
+                                   device const float* partial_out [[buffer(2)]],
+                                   device float* out [[buffer(3)]],
+                                   constant AttentionShape& shape [[buffer(4)]],
+                                   uint2 id [[thread_position_in_grid]])
+{
+    const int head = id.x / shape.head_dim;
+    const int d = id.x % shape.head_dim;
+    const int row = id.y;
+    const size_t first = ((size_t)row * shape.n_heads + head) * shape.position_splits;
+
+    float merged_max = -INFINITY;
+    for (int s = 0; s < shape.position_splits; ++s)
+        merged_max = max(merged_max, partial_max[first + s]);
+    float merged_sum = 0.0f;
+    float merged_out = 0.0f;
+    for (int s = 0; s < shape.position_splits; ++s) {
+        float weight = exp(partial_max[first + s] - merged_max);
+        merged_sum += partial_sum[first + s] * weight;
+        merged_out += partial_out[(first + s) * shape.head_dim + d] * weight;
+    }
+    out[(size_t)row * shape.q_stride + head * shape.head_dim + d] = merged_out / merged_sum;
 }
 )METAL";
 
@@ -408,7 +445,9 @@ struct AttentionShape {
     int q_stride;
     int kv_stride;
     int head_dim;
+    int n_heads;
     int kv_group;
+    int position_splits;
     float scale;
 };
 
@@ -444,16 +483,13 @@ NSUInteger float_offset(size_t count) {
 }
 
 void validate_model(const Model& m) {
-    if (m.head_dim > kMaxHeadDim || m.head_dim < 32 || kAttentionThreads % m.head_dim != 0)
-        throw std::runtime_error("the metal backend needs a head size that divides " +
-                                 std::to_string(kAttentionThreads) + " and is 32 to " +
+    if (m.head_dim % 32 != 0 || m.head_dim > kMaxHeadDim)
+        throw std::runtime_error("the metal backend needs a head size that is a multiple of 32, up to " +
                                  std::to_string(kMaxHeadDim));
-}
-
-void validate_cache(const KVCache& cache) {
-    if (cache.max_seq > kMaxPositions)
-        throw std::runtime_error("the metal backend supports max_seq up to " +
-                                 std::to_string(kMaxPositions));
+    if ((m.n_heads / m.n_kv_heads) * 32 > kMaxThreadsPerThreadgroup)
+        throw std::runtime_error("the metal backend supports at most " +
+                                 std::to_string(kMaxThreadsPerThreadgroup / 32) +
+                                 " query heads per KV head");
 }
 
 class MetalBackend {
@@ -471,6 +507,7 @@ class MetalBackend {
             copy_ = build_pipeline(library, @"copy_floats");
             silu_ = build_pipeline(library, @"silu_times");
             attention_ = build_pipeline(library, @"attention_rows");
+            merge_attention_ = build_pipeline(library, @"merge_attention_splits");
         }
 
         // One command buffer per step, so the CPU waits on the GPU once instead of per operation.
@@ -660,9 +697,23 @@ class MetalBackend {
         void encode_attention(id<MTLComputeCommandEncoder> encoder, const Model& m,
                               const RowGroup& group, const CacheBuffers& cache,
                               NSUInteger layer_offset) {
-            AttentionShape shape{(int)m.q_dim, (int)group.cache->kv_dim, m.head_dim,
-                                 m.n_heads / m.n_kv_heads, 1.0f / std::sqrt((float)m.head_dim)};
+            int kv_group = m.n_heads / m.n_kv_heads;
+            int splits = 1;
+            if (group.n_rows == 1) {
+                int n_positions = group.first_pos + 1;
+                splits = std::clamp((n_positions + kPositionsPerSplit - 1) / kPositionsPerSplit,
+                                    1, kMaxPositionSplits);
+            }
+            AttentionShape shape{(int)m.q_dim, (int)group.cache->kv_dim, m.head_dim, m.n_heads,
+                                 kv_group, splits, 1.0f / std::sqrt((float)m.head_dim)};
             NSUInteger row_offset = float_offset((size_t)group.first_row * m.q_dim);
+            size_t partial_slots = (size_t)group.n_rows * m.n_heads * splits;
+            if (splits > 1) {
+                ensure_capacity(attention_max_, float_offset(partial_slots));
+                ensure_capacity(attention_sum_, float_offset(partial_slots));
+                ensure_capacity(attention_out_, float_offset(partial_slots * m.head_dim));
+            }
+
             [encoder setComputePipelineState:attention_];
             [encoder setBuffer:q_ offset:row_offset atIndex:0];
             [encoder setBuffer:cache.K offset:layer_offset atIndex:1];
@@ -670,8 +721,21 @@ class MetalBackend {
             [encoder setBuffer:attn_ offset:row_offset atIndex:3];
             [encoder setBuffer:positions_ offset:group.first_row * sizeof(int) atIndex:4];
             [encoder setBytes:&shape length:sizeof(shape) atIndex:5];
-            [encoder dispatchThreadgroups:MTLSizeMake(m.n_heads, group.n_rows, 1)
-                    threadsPerThreadgroup:MTLSizeMake(kAttentionThreads, 1, 1)];
+            [encoder setBuffer:(splits > 1 ? attention_max_ : attn_) offset:0 atIndex:6];
+            [encoder setBuffer:(splits > 1 ? attention_sum_ : attn_) offset:0 atIndex:7];
+            [encoder setBuffer:(splits > 1 ? attention_out_ : attn_) offset:0 atIndex:8];
+            [encoder dispatchThreadgroups:MTLSizeMake(m.n_kv_heads, group.n_rows, splits)
+                    threadsPerThreadgroup:MTLSizeMake(32 * kv_group, 1, 1)];
+            if (splits == 1) return;
+
+            [encoder setComputePipelineState:merge_attention_];
+            [encoder setBuffer:attention_max_ offset:0 atIndex:0];
+            [encoder setBuffer:attention_sum_ offset:0 atIndex:1];
+            [encoder setBuffer:attention_out_ offset:0 atIndex:2];
+            [encoder setBuffer:attn_ offset:row_offset atIndex:3];
+            [encoder setBytes:&shape length:sizeof(shape) atIndex:4];
+            [encoder dispatchThreads:MTLSizeMake(m.n_heads * m.head_dim, group.n_rows, 1)
+               threadsPerThreadgroup:MTLSizeMake(kElementwiseThreads, 1, 1)];
         }
 
         void dispatch_elementwise(id<MTLComputeCommandEncoder> encoder, size_t count) {
@@ -701,7 +765,6 @@ class MetalBackend {
             }
             int* positions = static_cast<int*>([positions_ contents]);
             for (const RowGroup& group : groups) {
-                validate_cache(*group.cache);
                 for (int r = 0; r < group.n_rows; ++r)
                     positions[group.first_row + r] = group.first_pos + r;
             }
@@ -776,6 +839,7 @@ class MetalBackend {
         id<MTLComputePipelineState> copy_;
         id<MTLComputePipelineState> silu_;
         id<MTLComputePipelineState> attention_;
+        id<MTLComputePipelineState> merge_attention_;
 
         id<MTLBuffer> x_;
         id<MTLBuffer> xn_;
@@ -788,6 +852,9 @@ class MetalBackend {
         id<MTLBuffer> logits_;
         id<MTLBuffer> positions_;
         id<MTLBuffer> partials_;
+        id<MTLBuffer> attention_max_;
+        id<MTLBuffer> attention_sum_;
+        id<MTLBuffer> attention_out_;
 
         id<MTLBuffer> norms_;
         const Model* norms_model_ = nullptr;
