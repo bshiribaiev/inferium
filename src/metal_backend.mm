@@ -22,10 +22,11 @@ constexpr int kPositionsPerSplit = 64;
 constexpr int kMaxPositionSplits = 32;
 constexpr int kElementwiseThreads = 256;
 constexpr int kTileRows = 64;
-constexpr int kTileBatch = 32;
 constexpr int kTileThreads = 128;
-// Measured per decode step: tiled costs ~37ms at any batch, matrix-vector passes it between 4 and 8.
-constexpr int kMinBatchForTiles = 8;
+// Measured GPU ms per step: matrix-vector wins only at batch 1, 8-wide tiles up to ~24,
+// 32-wide tiles from 32 (53 vs 78ms) and for prefill.
+constexpr int kMinBatchForNarrowTiles = 2;
+constexpr int kMinBatchForWideTiles = 32;
 // Enough threadgroups to keep all ten GPU cores streaming weights.
 constexpr int kTargetThreadgroups = 256;
 constexpr int kMinBlocksPerSplit = 4;
@@ -133,10 +134,11 @@ kernel void multiply_int8_panels(device const int4* weights [[buffer(0)]],
 }
 
 constant int kTileRows = 64;
-constant int kTileBatch = 32;
 constant int kTileK = 32;
 
 // Batches are compute-bound: tiles are staged once and multiplied on the 8x8 matrix units.
+// The batch-tile width is a template so small batches don't pay for 32 mostly-empty rows.
+template <int kTileBatch>
 kernel void multiply_int8_tiles(device const int4* weights [[buffer(0)]],
                                 device const half* scales [[buffer(1)]],
                                 device const float* x [[buffer(2)]],
@@ -147,6 +149,12 @@ kernel void multiply_int8_tiles(device const int4* weights [[buffer(0)]],
                                 uint simd_id [[simdgroup_index_in_threadgroup]],
                                 uint thread_index [[thread_index_in_threadgroup]])
 {
+    constexpr int kRowsPerSimdgroup = kTileBatch == 32 ? 32 : 16;
+    constexpr int kBatchPerSimdgroup = kTileBatch == 32 ? 16 : 8;
+    constexpr int kRowBlocks = kRowsPerSimdgroup / 8;
+    constexpr int kBatchBlocks = kBatchPerSimdgroup / 8;
+    constexpr int kRowGroups = kTileRows / kRowsPerSimdgroup;
+
     threadgroup float w_tile[kTileRows * kTileK];
     threadgroup float x_tile[kTileBatch * kTileK];
 
@@ -161,16 +169,11 @@ kernel void multiply_int8_tiles(device const int4* weights [[buffer(0)]],
     const int panel = first_row / kPanelRows + load_panel;
     const bool panel_in_range = panel * kPanelRows < shape.rows;
 
-    const int x_row = thread_index / 4;
-    const int x_col = (thread_index % 4) * 8;
-    const bool x_in_range = first_b + x_row < shape.batch;
-    device const float* x_src = x + (size_t)(first_b + x_row) * shape.cols + x_col;
-
-    const int out_row = (simd_id % 2) * 32;
-    const int out_b = (simd_id / 2) * 16;
-    simdgroup_float8x8 acc[4][2];
-    for (int i = 0; i < 4; ++i)
-        for (int j = 0; j < 2; ++j)
+    const int out_row = (simd_id % kRowGroups) * kRowsPerSimdgroup;
+    const int out_b = (simd_id / kRowGroups) * kBatchPerSimdgroup;
+    simdgroup_float8x8 acc[kRowBlocks][kBatchBlocks];
+    for (int i = 0; i < kRowBlocks; ++i)
+        for (int j = 0; j < kBatchBlocks; ++j)
             acc[i][j] = simdgroup_float8x8(0.0f);
 
     const int first_block = tile.z * shape.blocks_per_split;
@@ -189,34 +192,33 @@ kernel void multiply_int8_tiles(device const int4* weights [[buffer(0)]],
                 *(threadgroup float4*)(w_dst + r * kTileK) = float4(0.0f);
         }
 
-        threadgroup float* x_dst = x_tile + x_row * kTileK + x_col;
-        if (x_in_range) {
-            device const float* src = x_src + block * kTileK;
-            *(threadgroup float4*)(x_dst + 0) = *(device const float4*)(src + 0);
-            *(threadgroup float4*)(x_dst + 4) = *(device const float4*)(src + 4);
-        } else {
-            *(threadgroup float4*)(x_dst + 0) = float4(0.0f);
-            *(threadgroup float4*)(x_dst + 4) = float4(0.0f);
+        for (int i = thread_index; i < kTileBatch * kTileK / 4; i += 128) {
+            int x_row = i / (kTileK / 4);
+            int x_col = (i % (kTileK / 4)) * 4;
+            float4 value = float4(0.0f);
+            if (first_b + x_row < shape.batch)
+                value = *(device const float4*)(x + (size_t)(first_b + x_row) * shape.cols + block * kTileK + x_col);
+            *(threadgroup float4*)(x_tile + x_row * kTileK + x_col) = value;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (int k = 0; k < kTileK; k += 8) {
-            simdgroup_float8x8 w_part[4];
-            simdgroup_float8x8 x_part[2];
-            for (int i = 0; i < 4; ++i)
+            simdgroup_float8x8 w_part[kRowBlocks];
+            simdgroup_float8x8 x_part[kBatchBlocks];
+            for (int i = 0; i < kRowBlocks; ++i)
                 simdgroup_load(w_part[i], w_tile + (out_row + i * 8) * kTileK + k, kTileK);
-            for (int j = 0; j < 2; ++j)
+            for (int j = 0; j < kBatchBlocks; ++j)
                 simdgroup_load(x_part[j], x_tile + (out_b + j * 8) * kTileK + k, kTileK, ulong2(0, 0), true);
-            for (int i = 0; i < 4; ++i)
-                for (int j = 0; j < 2; ++j)
+            for (int i = 0; i < kRowBlocks; ++i)
+                for (int j = 0; j < kBatchBlocks; ++j)
                     simdgroup_multiply_accumulate(acc[i][j], w_part[i], x_part[j], acc[i][j]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     threadgroup float* staged = w_tile;
-    for (int i = 0; i < 4; ++i)
-        for (int j = 0; j < 2; ++j)
+    for (int i = 0; i < kRowBlocks; ++i)
+        for (int j = 0; j < kBatchBlocks; ++j)
             simdgroup_store(acc[i][j], staged + (out_b + j * 8) * kTileRows + out_row + i * 8, kTileRows,
                             ulong2(0, 0), true);
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -234,6 +236,13 @@ kernel void multiply_int8_tiles(device const int4* weights [[buffer(0)]],
         out[index_in_out] = shape.accumulate ? out[index_in_out] + value : value;
     }
 }
+
+#define INSTANTIATE_TILES(width)                                                              \
+    template [[host_name("multiply_int8_tiles_" #width)]] kernel void multiply_int8_tiles<width>( \
+        device const int4*, device const half*, device const float*, device float*,           \
+        constant MatmulShape&, device float*, uint3, uint, uint);
+INSTANTIATE_TILES(8)
+INSTANTIATE_TILES(32)
 
 // Sums the split-K partials in a fixed order, so results don't vary run to run.
 kernel void add_partials(device const float* partials [[buffer(0)]],
@@ -500,7 +509,8 @@ class MetalBackend {
             queue_ = [device_ newCommandQueue];
             id<MTLLibrary> library = compile_library();
             matmul_ = build_pipeline(library, @"multiply_int8_panels");
-            matmul_tiles_ = build_pipeline(library, @"multiply_int8_tiles");
+            narrow_tiles_ = build_pipeline(library, @"multiply_int8_tiles_8");
+            wide_tiles_ = build_pipeline(library, @"multiply_int8_tiles_32");
             add_partials_ = build_pipeline(library, @"add_partials");
             rms_norm_ = build_pipeline(library, @"rms_norm_rows");
             rope_ = build_pipeline(library, @"rope_rows");
@@ -613,8 +623,13 @@ class MetalBackend {
                            id<MTLBuffer> input, NSUInteger input_offset,
                            id<MTLBuffer> output, NSUInteger output_offset,
                            int batch, bool accumulate) {
-            if (batch >= kMinBatchForTiles) {
-                encode_tiled_matmul(encoder, W, input, input_offset, output, output_offset,
+            if (batch >= kMinBatchForWideTiles) {
+                encode_tiled_matmul(encoder, wide_tiles_, 32, W, input, input_offset, output, output_offset,
+                                    batch, accumulate);
+                return;
+            }
+            if (batch >= kMinBatchForNarrowTiles) {
+                encode_tiled_matmul(encoder, narrow_tiles_, 8, W, input, input_offset, output, output_offset,
                                     batch, accumulate);
                 return;
             }
@@ -630,13 +645,15 @@ class MetalBackend {
                     threadsPerThreadgroup:MTLSizeMake(32 * kSplits, 1, 1)];
         }
 
-        void encode_tiled_matmul(id<MTLComputeCommandEncoder> encoder, const PackedMatrix& W,
+        void encode_tiled_matmul(id<MTLComputeCommandEncoder> encoder,
+                                 id<MTLComputePipelineState> pipeline, int tile_batch,
+                                 const PackedMatrix& W,
                                  id<MTLBuffer> input, NSUInteger input_offset,
                                  id<MTLBuffer> output, NSUInteger output_offset,
                                  int batch, bool accumulate) {
             const WeightBuffers& weights = buffers_for(W);
             int row_tiles = (W.rows + kTileRows - 1) / kTileRows;
-            int batch_tiles = (batch + kTileBatch - 1) / kTileBatch;
+            int batch_tiles = (batch + tile_batch - 1) / tile_batch;
             int n_blocks = W.cols / kQuantBlock;
             int wanted_splits = (kTargetThreadgroups + row_tiles * batch_tiles - 1) / (row_tiles * batch_tiles);
             int blocks_per_split = std::max(kMinBlocksPerSplit, (n_blocks + wanted_splits - 1) / wanted_splits);
@@ -645,7 +662,7 @@ class MetalBackend {
             if (splits > 1)
                 ensure_capacity(partials_, float_offset((size_t)splits * batch * W.rows));
 
-            [encoder setComputePipelineState:matmul_tiles_];
+            [encoder setComputePipelineState:pipeline];
             [encoder setBuffer:weights.values offset:0 atIndex:0];
             [encoder setBuffer:weights.scales offset:0 atIndex:1];
             [encoder setBuffer:input offset:input_offset atIndex:2];
@@ -832,7 +849,8 @@ class MetalBackend {
         id<MTLDevice> device_;
         id<MTLCommandQueue> queue_;
         id<MTLComputePipelineState> matmul_;
-        id<MTLComputePipelineState> matmul_tiles_;
+        id<MTLComputePipelineState> narrow_tiles_;
+        id<MTLComputePipelineState> wide_tiles_;
         id<MTLComputePipelineState> add_partials_;
         id<MTLComputePipelineState> rms_norm_;
         id<MTLComputePipelineState> rope_;
