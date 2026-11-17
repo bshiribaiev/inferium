@@ -46,6 +46,9 @@ target_link_libraries(inferium_bench PRIVATE inferium_core)
 add_executable(inferium_server src/server_main.cpp)
 target_link_libraries(inferium_server PRIVATE inferium_core)
 
+add_executable(inferium_perplexity src/perplexity.cpp)
+target_link_libraries(inferium_perplexity PRIVATE inferium_core)
+
 find_package(Protobuf CONFIG)
 find_package(gRPC CONFIG)
 

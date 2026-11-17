@@ -10,6 +10,9 @@ void metal_initialize();
 int metal_prefill_chunk(const Model& m, KVCache& cache, const std::vector<int>& tokens,
                         int past_len);
 
+void metal_prefill_logits(const Model& m, KVCache& cache, const std::vector<int>& tokens,
+                          int past_len, std::vector<float>& logits);
+
 void metal_decode_batch(const Model& m, const std::vector<DecodeSlot>& slots,
                         std::vector<int>& next_tokens);
 

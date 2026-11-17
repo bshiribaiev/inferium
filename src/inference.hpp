@@ -39,6 +39,10 @@ size_t activation_arena_bytes(const Model& m, int max_rows, int max_logit_rows);
 int prefill_chunk(const Model& m, KVCache& cache, const std::vector<int>& tokens,
                   int past_len, Arena& arena);
 
+// Logits for every token rather than just the next one, for scoring text.
+void prefill_logits(const Model& m, KVCache& cache, const std::vector<int>& tokens,
+                    int past_len, Arena& arena, std::vector<float>& logits);
+
 void decode_batch(const Model& m, const std::vector<DecodeSlot>& slots,
                   Arena& arena, std::vector<int>& next_tokens);
 

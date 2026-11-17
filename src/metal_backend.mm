@@ -521,9 +521,9 @@ class MetalBackend {
         }
 
         // One command buffer per step, so the CPU waits on the GPU once instead of per operation.
-        void run_step(const Model& m, const std::vector<int>& tokens,
-                      const std::vector<RowGroup>& groups, int first_logit_row,
-                      std::vector<int>& next_tokens) {
+        // Returns the logits of rows first_logit_row onwards, valid until the next step.
+        const float* run_step(const Model& m, const std::vector<int>& tokens,
+                              const std::vector<RowGroup>& groups, int first_logit_row) {
             @autoreleasepool {
                 validate_model(m);
                 int rows = (int)tokens.size();
@@ -547,7 +547,7 @@ class MetalBackend {
                 if (commands.status == MTLCommandBufferStatusError)
                     throw std::runtime_error("Metal step failed: " +
                                              std::string(commands.error.localizedDescription.UTF8String));
-                read_argmax(m, logit_rows, next_tokens);
+                return static_cast<const float*>([logits_ contents]);
             }
         }
 
@@ -787,15 +787,6 @@ class MetalBackend {
             }
         }
 
-        void read_argmax(const Model& m, int logit_rows, std::vector<int>& next_tokens) {
-            const float* logits = static_cast<const float*>([logits_ contents]);
-            next_tokens.resize(logit_rows);
-            for (int r = 0; r < logit_rows; ++r) {
-                const float* row = logits + (size_t)r * m.vocab_size;
-                next_tokens[r] = (int)(std::max_element(row, row + m.vocab_size) - row);
-            }
-        }
-
         NSUInteger layer_norm_offset(const Model& m, uint64_t layer_index, int which) const {
             return float_offset((layer_index * 2 + which) * m.embd_dim);
         }
@@ -885,6 +876,10 @@ std::unique_ptr<MetalBackend>& backend_instance() {
     return instance;
 }
 
+int argmax_token(const float* logits_row, int64_t vocab_size) {
+    return (int)(std::max_element(logits_row, logits_row + vocab_size) - logits_row);
+}
+
 MetalBackend& metal_backend() {
     std::unique_ptr<MetalBackend>& instance = backend_instance();
     if (!instance) instance = std::make_unique<MetalBackend>();
@@ -901,9 +896,16 @@ int metal_prefill_chunk(const Model& m, KVCache& cache, const std::vector<int>& 
                         int past_len) {
     int rows = (int)tokens.size();
     std::vector<RowGroup> groups{{&cache, 0, rows, past_len}};
-    std::vector<int> next_tokens;
-    metal_backend().run_step(m, tokens, groups, rows - 1, next_tokens);
-    return next_tokens[0];
+    const float* logits = metal_backend().run_step(m, tokens, groups, rows - 1);
+    return argmax_token(logits, m.vocab_size);
+}
+
+void metal_prefill_logits(const Model& m, KVCache& cache, const std::vector<int>& tokens,
+                          int past_len, std::vector<float>& logits) {
+    int rows = (int)tokens.size();
+    std::vector<RowGroup> groups{{&cache, 0, rows, past_len}};
+    const float* computed = metal_backend().run_step(m, tokens, groups, 0);
+    logits.assign(computed, computed + (size_t)rows * m.vocab_size);
 }
 
 void metal_decode_batch(const Model& m, const std::vector<DecodeSlot>& slots,
@@ -914,7 +916,10 @@ void metal_decode_batch(const Model& m, const std::vector<DecodeSlot>& slots,
         tokens.push_back(slots[b].token);
         groups.push_back({slots[b].cache, (int)b, 1, slots[b].pos});
     }
-    metal_backend().run_step(m, tokens, groups, 0, next_tokens);
+    const float* logits = metal_backend().run_step(m, tokens, groups, 0);
+    next_tokens.resize(slots.size());
+    for (size_t b = 0; b < slots.size(); ++b)
+        next_tokens[b] = argmax_token(logits + b * m.vocab_size, m.vocab_size);
 }
 
 void metal_forget_cache(const KVCache& cache) {

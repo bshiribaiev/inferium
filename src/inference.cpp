@@ -61,38 +61,36 @@ void ffn_block(const Model& m, const LayerWeights& layer,
                  input, n_new, m.embd_dim, m.ffn_dim, arena);
 }
 
-int greedy_next_token(const Model& m, const float* hidden_row, Arena& arena) {
-    ArenaScope scope(arena);
-    float* hidden = arena.alloc_floats(m.embd_dim);
-    float* logits = arena.alloc_floats(m.vocab_size);
-
-    std::copy(hidden_row, hidden_row + m.embd_dim, hidden);
-    rms_norm(hidden, m.final_norm, m.embd_dim);
-    multiply_weights_by_batch(m.Wout, hidden, logits, 1);
-
-    return (int)(std::max_element(logits, logits + m.vocab_size) - logits);
-}
-
-void greedy_next_tokens(const Model& m, const float* hidden_rows, int batch,
-                        Arena& arena, std::vector<int>& out) {
+void compute_logits(const Model& m, const float* hidden_rows, int batch, Arena& arena,
+                    float* logits) {
     ArenaScope scope(arena);
     float* normed = arena.alloc_floats((size_t)batch * m.embd_dim);
-    float* logits = arena.alloc_floats((size_t)batch * m.vocab_size);
-
     for (int b = 0; b < batch; ++b) {
         const float* src = hidden_rows + (size_t)b * m.embd_dim;
         float* dst = normed + (size_t)b * m.embd_dim;
         std::copy(src, src + m.embd_dim, dst);
         rms_norm(dst, m.final_norm, m.embd_dim);
     }
-
     multiply_weights_by_batch(m.Wout, normed, logits, batch);
+}
+
+void greedy_next_tokens(const Model& m, const float* hidden_rows, int batch,
+                        Arena& arena, std::vector<int>& out) {
+    ArenaScope scope(arena);
+    float* logits = arena.alloc_floats((size_t)batch * m.vocab_size);
+    compute_logits(m, hidden_rows, batch, arena, logits);
 
     out.resize(batch);
     for (int b = 0; b < batch; ++b) {
         const float* row = logits + (size_t)b * m.vocab_size;
         out[b] = (int)(std::max_element(row, row + m.vocab_size) - row);
     }
+}
+
+int greedy_next_token(const Model& m, const float* hidden_row, Arena& arena) {
+    std::vector<int> next;
+    greedy_next_tokens(m, hidden_row, 1, arena, next);
+    return next[0];
 }
 
 void decode_on_cpu(const Model& m, const std::vector<DecodeSlot>& slots,
@@ -195,6 +193,19 @@ int prefill_chunk(const Model& m, KVCache& cache, const std::vector<int>& tokens
     float* hidden = forward(m, cache, tokens, past_len, arena);
     int last_row = (int)tokens.size() - 1;
     return greedy_next_token(m, hidden + (size_t)last_row * m.embd_dim, arena);
+}
+
+void prefill_logits(const Model& m, KVCache& cache, const std::vector<int>& tokens,
+                    int past_len, Arena& arena, std::vector<float>& logits) {
+    if (current_backend() == Backend::Metal) {
+        metal_prefill_logits(m, cache, tokens, past_len, logits);
+        return;
+    }
+
+    arena.reset();
+    float* hidden = forward(m, cache, tokens, past_len, arena);
+    logits.resize(tokens.size() * m.vocab_size);
+    compute_logits(m, hidden, (int)tokens.size(), arena, logits.data());
 }
 
 KVCache::KVCache(const Model& m, int max_seq)
