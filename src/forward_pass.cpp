@@ -196,34 +196,39 @@ void attention(
     int kv_group  = n_heads / n_kv_heads;
     int q_stride  = n_heads    * head_dim;
     int kv_stride = n_kv_heads * head_dim;
-    std::vector<float> scores(past_len + n_new);
+    int max_positions = past_len + n_new;
 
-    for (int h = 0; h < n_heads; ++h) {
-        int h_kv = h / kv_group;
+    split_range_across_threads(n_heads, [&](int first_head, int last_head) {
+        thread_local std::vector<float> scores;
+        scores.resize(max_positions);
 
-        for (int i = 0; i < n_new; ++i) {
-            int pos = past_len + i;
-            const float* q = Q + i * q_stride + h * head_dim;
+        for (int h = first_head; h < last_head; ++h) {
+            int h_kv = h / kv_group;
 
-            for (int j = 0; j <= pos; ++j) {
-                const float* k = K + j * kv_stride + h_kv * head_dim;
-                float dot = 0.0f;
+            for (int i = 0; i < n_new; ++i) {
+                int pos = past_len + i;
+                const float* q = Q + i * q_stride + h * head_dim;
 
-                for (int d = 0; d < head_dim; ++d)
-                    dot += q[d] * k[d];
-                scores[j] = dot / std::sqrt((float)head_dim);
-            }
-            softmax(scores.data(), pos + 1);
+                for (int j = 0; j <= pos; ++j) {
+                    const float* k = K + j * kv_stride + h_kv * head_dim;
+                    float dot = 0.0f;
 
-            float* o = out + i * q_stride + h * head_dim;
-            std::fill(o, o + head_dim, 0.0f);
-            for (int j = 0; j <= pos; ++j) {
-                const float* v = V + j * kv_stride + h_kv * head_dim;
-                for (int d = 0; d < head_dim; ++d)
-                    o[d] += scores[j] * v[d];
+                    for (int d = 0; d < head_dim; ++d)
+                        dot += q[d] * k[d];
+                    scores[j] = dot / std::sqrt((float)head_dim);
+                }
+                softmax(scores.data(), pos + 1);
+
+                float* o = out + i * q_stride + h * head_dim;
+                std::fill(o, o + head_dim, 0.0f);
+                for (int j = 0; j <= pos; ++j) {
+                    const float* v = V + j * kv_stride + h_kv * head_dim;
+                    for (int d = 0; d < head_dim; ++d)
+                        o[d] += scores[j] * v[d];
+                }
             }
         }
-    }
+    });
 }
 
 void output_projection(
