@@ -1,5 +1,6 @@
 #include "forward_pass.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <condition_variable>
 #include <mutex>
@@ -53,6 +54,8 @@ static ThreadPool& global_pool()
     return pool;
 }
 
+static constexpr int kChunksPerThread = 8;
+
 template <typename Fn>
 static void split_range_across_threads(int count, Fn process_range)
 {
@@ -63,22 +66,22 @@ static void split_range_across_threads(int count, Fn process_range)
         return;
     }
 
-    int chunk = (count + n_threads - 1) / n_threads;
+    // Small chunks claimed on demand let fast cores take more of the work instead of
+    // every thread waiting on whichever one landed on the slowest core.
+    int chunk = std::max(1, count / ((int)n_threads * kChunksPerThread));
+    std::atomic<int> next_start{0};
     std::mutex m;
     std::condition_variable done;
-    int pending = 0;
+    int pending = (int)n_threads;
 
     ThreadPool& pool = global_pool();
     for (unsigned t = 0; t < n_threads; ++t) {
-        int start = t * chunk;
-        int end = std::min(start + chunk, count);
-        if (start >= end) break;
-        {
-            std::lock_guard<std::mutex> lock(m);
-            ++pending;
-        }
-        pool.submit([&, start, end] {
-            process_range(start, end);
+        pool.submit([&] {
+            while (true) {
+                int start = next_start.fetch_add(chunk);
+                if (start >= count) break;
+                process_range(start, std::min(start + chunk, count));
+            }
             std::lock_guard<std::mutex> lock(m);
             --pending;
             done.notify_one();
