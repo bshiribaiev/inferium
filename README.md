@@ -40,6 +40,9 @@ You get ` Paris.` and then some rambling about ancient Rome, at ~80 tok/s on an 
 Threads default to core count, override with `INFERIUM_THREADS=8`. Eight is the sweet
 spot; past that it slows down (see efficiency notes).
 
+To run on the GPU instead, set `INFERIUM_BACKEND=metal` (or pass `--backend metal` to the
+server, worker and bench). CPU is the default.
+
 ## serving
 
 ```
@@ -123,10 +126,21 @@ Throughput vs batch size, 8 threads:
 3.4x throughput at batch 8, average of 2 runs, 16 requests. Peak RSS is 2.3GB.
 A ~250-token prompt prefills in 0.9s.
 
+CPU vs Metal, alternating runs:
+
+| | CPU | Metal |
+| --- | --- | --- |
+| single-stream, 64 tokens | 70–83 tok/s | 68–70 tok/s |
+| batch 4 | 200–207 tok/s | 136 tok/s |
+| batch 8 | 244 tok/s | 184–186 tok/s |
+| batch 16 | 243–264 tok/s | **285–289 tok/s** |
+| ~250-token prefill | 0.90s | **0.39s** |
+
 Run it yourself:
 
 ```
 ./build/inferium_bench model.gguf --requests 16 --concurrency 8 --batch 8 --threads 8
+./build/inferium_bench model.gguf --requests 16 --concurrency 8 --batch 8 --backend metal
 ```
 
 ## efficiency notes
@@ -160,6 +174,16 @@ waiting.
 
 Attention still grows with sequence length: at 256 tokens single-stream drops to ~60 tok/s.
 
+The Metal backend shares the CPU's memory (unified memory), so the weights and KV cache are
+used in place, with no copy, and single-stream hits the same ~100 GB/s ceiling. Its first
+version ran each matmul as its own GPU job and spent ~200µs per round trip waiting, 20
+tok/s in total; encoding a whole step into one command buffer removed that. Batches and
+prefill are compute-bound, so they use a tiled kernel that stages weight and activation
+tiles in threadgroup memory and multiplies them on the GPU's 8x8 matrix units, with the
+columns split across threadgroups so small batches still fill all ten GPU cores. Metal
+keeps activations in float while the CPU rounds them to int8, so the two can pick a
+different token on a near tie; 3 of 8 bench prompts diverge partway through.
+
 ## todos
 
 - 4-bit weights with a native 4-bit kernel. Bytes per token is still the ceiling, so
@@ -168,6 +192,8 @@ Attention still grows with sequence length: at 256 tokens single-stream drops to
   as the int8 path's.
 - Vectorize attention and store the KV cache as `float16` or `int8`. It's still scalar and
   rereads the full history every step, which is why long sequences slow down.
+- Metal: a faster kernel for batches 2–8, where it still trails the CPU, and attention
+  that reads K rows coalesced instead of one position per thread.
 - Stream tokens back as they are generated.
 - More architectures. `general.architecture` is already parsed out of the GGUF and unused,
   so that is the seam. Llama-family variants need QKV bias support and more quant formats;
@@ -183,6 +209,9 @@ Attention still grows with sequence length: at 256 tokens single-stream drops to
 **`matrix with N rows is not a multiple of 16`** / **`columns is not a multiple of 32`** —
 weights are packed in 16-row panels and quantized in 32-column blocks. Every Llama size
 fits; an odd custom model may not.
+
+**`the metal backend supports max_seq up to 4096`** — attention keeps a position's scores
+in threadgroup memory, which caps the sequence length on the GPU.
 
 **`prompt exceeds max_seq`** — bump `--max-seq`. It's 512 by default because each slot
 preallocates its own KV cache and they add up.
