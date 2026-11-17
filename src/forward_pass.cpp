@@ -1,16 +1,13 @@
 #include "forward_pass.hpp"
 #include <algorithm>
-#include <atomic>
 #include <cmath>
-#include <condition_variable>
-#include <mutex>
 #include <thread>
 #include <vector>
 #include <arm_neon.h>
 #include <sys/sysctl.h>
 
 #include "sme_matmul.hpp"
-#include "thread_pool.hpp"
+#include "worker_team.hpp"
 
 std::vector<float> embed_tokens(
     const std::vector<int>& token_ids,
@@ -50,10 +47,10 @@ static unsigned resolve_thread_count()
     return std::max(1u, std::thread::hardware_concurrency());
 }
 
-static ThreadPool& global_pool()
+static WorkerTeam& worker_team()
 {
-    static ThreadPool pool(resolve_thread_count());
-    return pool;
+    static WorkerTeam team((int)resolve_thread_count() - 1);
+    return team;
 }
 
 static constexpr int kChunksPerThread = 8;
@@ -61,37 +58,16 @@ static constexpr int kChunksPerThread = 8;
 template <typename Fn>
 static void split_range_across_threads(int count, Fn process_range)
 {
-    unsigned n_threads = resolve_thread_count();
-    n_threads = std::min(n_threads, (unsigned)count);
-    if (n_threads <= 1) {
+    WorkerTeam& team = worker_team();
+    if (team.thread_count() <= 1 || count <= 1) {
         process_range(0, count);
         return;
     }
 
     // Small chunks claimed on demand let fast cores take more of the work instead of
     // every thread waiting on whichever one landed on the slowest core.
-    int chunk = std::max(1, count / ((int)n_threads * kChunksPerThread));
-    std::atomic<int> next_start{0};
-    std::mutex m;
-    std::condition_variable done;
-    int pending = (int)n_threads;
-
-    ThreadPool& pool = global_pool();
-    for (unsigned t = 0; t < n_threads; ++t) {
-        pool.submit([&] {
-            while (true) {
-                int start = next_start.fetch_add(chunk);
-                if (start >= count) break;
-                process_range(start, std::min(start + chunk, count));
-            }
-            std::lock_guard<std::mutex> lock(m);
-            --pending;
-            done.notify_one();
-        });
-    }
-
-    std::unique_lock<std::mutex> lock(m);
-    done.wait(lock, [&] { return pending == 0; });
+    int chunk = std::max(1, count / (team.thread_count() * kChunksPerThread));
+    team.run(count, chunk, process_range);
 }
 
 static bool cpu_has_sme2()

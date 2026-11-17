@@ -21,7 +21,7 @@ add_library(inferium_core STATIC
     src/forward_pass.cpp
     src/packed_matrix.cpp
     src/sme_matmul.cpp
-    src/thread_pool.cpp
+    src/worker_team.cpp
     src/engine.cpp
     src/model_loader.cpp
     src/server_options.cpp
