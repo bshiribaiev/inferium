@@ -124,7 +124,7 @@ Throughput vs batch size, 8 threads:
 | 16 | 265 | 1.89s |
 
 3.4x throughput at batch 8, average of 2 runs, 16 requests. Peak RSS is 2.3GB.
-A ~250-token prompt prefills in 0.9s.
+A 310-token prompt prefills in 0.9s.
 
 CPU vs Metal. The CPU column is from a quiet run; the Metal one is from a later run while
 the machine was busy, which barely touches the GPU but cut the CPU's numbers by ~40%:
@@ -134,7 +134,7 @@ the machine was busy, which barely touches the GPU but cut the CPU's numbers by 
 | single-stream, 64 tokens | 70–83 tok/s | 48–65 tok/s |
 | batch 8 | 244 tok/s | **238–271 tok/s** |
 | batch 16 | 243–264 tok/s | **260–298 tok/s** |
-| ~250-token prefill | 0.90s | **0.40s** |
+| 310-token prefill | 0.90s | **0.40s** |
 
 GPU time per decode step, which load doesn't distort:
 
