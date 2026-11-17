@@ -126,21 +126,43 @@ Throughput vs batch size, 8 threads:
 3.4x throughput at batch 8, average of 2 runs, 16 requests. Peak RSS is 2.3GB.
 A ~250-token prompt prefills in 0.9s.
 
-CPU vs Metal, alternating runs:
+CPU vs Metal. The CPU column is from a quiet run; the Metal one is from a later run while
+the machine was busy, which barely touches the GPU but cut the CPU's numbers by ~40%:
 
 | | CPU | Metal |
 | --- | --- | --- |
-| single-stream, 64 tokens | 70–83 tok/s | 68–70 tok/s |
-| batch 4 | 200–207 tok/s | 136 tok/s |
-| batch 8 | 244 tok/s | 184–186 tok/s |
-| batch 16 | 243–264 tok/s | **285–289 tok/s** |
-| ~250-token prefill | 0.90s | **0.39s** |
+| single-stream, 64 tokens | 70–83 tok/s | 48–65 tok/s |
+| batch 8 | 244 tok/s | **238–271 tok/s** |
+| batch 16 | 243–264 tok/s | **260–298 tok/s** |
+| ~250-token prefill | 0.90s | **0.40s** |
+
+GPU time per decode step, which load doesn't distort:
+
+| kernel | batch 1 | 2 | 4 | 8 | 16 |
+| --- | --- | --- | --- | --- | --- |
+| matrix-vector | **13.9ms** | 15.2ms | 24.8ms | 45.9ms | 90.9ms |
+| 8-wide tiles | 14.7ms | **14.8ms** | **16.5ms** | **19.0ms** | **30.1ms** |
+| 32-wide tiles | 31.9ms | 31.3ms | 33.7ms | 34.3ms | 43.6ms |
+
+At ~1000 tokens of context a Metal decode step takes 15.9ms (31.2ms before the attention
+rewrite) and a 1000-token prefill 1.7s.
+
+Quality, scoring 4,088 tokens of Shakespeare with `inferium_perplexity`:
+
+| | perplexity | top-1 accuracy |
+| --- | --- | --- |
+| CPU, int8 activations | 52.28 | 35.9% |
+| Metal, float activations | 52.27 | 35.8% |
+
+The two pick the same top token 98.3% of the time, with a mean KL divergence of 0.0005 nats,
+so rounding activations to int8 costs about nothing.
 
 Run it yourself:
 
 ```
 ./build/inferium_bench model.gguf --requests 16 --concurrency 8 --batch 8 --threads 8
 ./build/inferium_bench model.gguf --requests 16 --concurrency 8 --batch 8 --backend metal
+./build/inferium_perplexity model.gguf some_text.txt --window 512 --max-tokens 4096
 ```
 
 ## efficiency notes
@@ -178,10 +200,17 @@ The Metal backend shares the CPU's memory (unified memory), so the weights and K
 used in place, with no copy, and single-stream hits the same ~100 GB/s ceiling. Its first
 version ran each matmul as its own GPU job and spent ~200µs per round trip waiting, 20
 tok/s in total; encoding a whole step into one command buffer removed that. Batches and
-prefill are compute-bound, so they use a tiled kernel that stages weight and activation
-tiles in threadgroup memory and multiplies them on the GPU's 8x8 matrix units, with the
-columns split across threadgroups so small batches still fill all ten GPU cores. Metal
-keeps activations in float while the CPU rounds them to int8, so the two can pick a
+prefill are compute-bound, so they use tiled kernels that stage weight and activation
+tiles in threadgroup memory and multiply them on the GPU's 8x8 matrix units, 8 batch rows
+wide up to batch 31 and 32 wide beyond, with the columns split across threadgroups so
+small batches still fill all ten GPU cores.
+
+Metal attention gives each group of query heads that share a KV head one threadgroup, so
+they read each K and V row together instead of 8 times over, and uses an online softmax
+so nothing is stored per position. Decode has only one row, so its positions are also split
+across threadgroups and merged, otherwise 4 threadgroups would leave most of the GPU idle.
+
+Metal keeps activations in float while the CPU rounds them to int8, so the two can pick a
 different token on a near tie; 3 of 8 bench prompts diverge partway through.
 
 ## todos
@@ -192,8 +221,8 @@ different token on a near tie; 3 of 8 bench prompts diverge partway through.
   as the int8 path's.
 - Vectorize attention and store the KV cache as `float16` or `int8`. It's still scalar and
   rereads the full history every step, which is why long sequences slow down.
-- Metal: a faster kernel for batches 2–8, where it still trails the CPU, and attention
-  that reads K rows coalesced instead of one position per thread.
+- Metal: single-stream still trails the CPU slightly; the matrix-vector kernel reaches
+  ~94 GB/s, so the rest is in the small per-step kernels.
 - Stream tokens back as they are generated.
 - More architectures. `general.architecture` is already parsed out of the GGUF and unused,
   so that is the seam. Llama-family variants need QKV bias support and more quant formats;
@@ -209,9 +238,6 @@ different token on a near tie; 3 of 8 bench prompts diverge partway through.
 **`matrix with N rows is not a multiple of 16`** / **`columns is not a multiple of 32`** —
 weights are packed in 16-row panels and quantized in 32-column blocks. Every Llama size
 fits; an odd custom model may not.
-
-**`the metal backend supports max_seq up to 4096`** — attention keeps a position's scores
-in threadgroup memory, which caps the sequence length on the GPU.
 
 **`prompt exceeds max_seq`** — bump `--max-seq`. It's 512 by default because each slot
 preallocates its own KV cache and they add up.
