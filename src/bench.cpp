@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <iostream>
 #include <mutex>
 #include <string>
@@ -94,67 +95,72 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    BenchOptions options = parse_options(argc, argv);
-    if (options.threads > 0) set_num_threads(options.threads);
-    set_backend(parse_backend(options.backend));
+    try {
+        BenchOptions options = parse_options(argc, argv);
+        if (options.threads > 0) set_num_threads(options.threads);
+        set_backend(parse_backend(options.backend));
 
-    MappedFile model_file(options.model_path);
-    const uint8_t* base = static_cast<const uint8_t*>(model_file.data());
-    GgufParser parser(base, model_file.size());
-    Tokenizer tokenizer(parser.vocab_tokens, parser.vocab_scores,
-                        parser.bos_token_id, parser.eos_token_id);
-    Model model = load_model(parser, base);
+        MappedFile model_file(options.model_path);
+        const uint8_t* base = static_cast<const uint8_t*>(model_file.data());
+        GgufParser parser(base, model_file.size());
+        Tokenizer tokenizer(parser.vocab_tokens, parser.vocab_scores,
+                            parser.bos_token_id, parser.eos_token_id);
+        Model model = load_model(parser, base);
 
-    EngineConfig config;
-    config.max_batch = options.max_batch;
-    InferenceEngine engine(model, tokenizer, config);
+        EngineConfig config;
+        config.max_batch = options.max_batch;
+        InferenceEngine engine(model, tokenizer, config);
 
-    std::atomic<int> next_request{0};
-    std::atomic<int> generated_tokens{0};
-    std::vector<double> latencies_ms;
-    std::mutex latencies_mutex;
+        std::atomic<int> next_request{0};
+        std::atomic<int> generated_tokens{0};
+        std::vector<double> latencies_ms;
+        std::mutex latencies_mutex;
 
-    auto wall_start = std::chrono::steady_clock::now();
+        auto wall_start = std::chrono::steady_clock::now();
 
-    std::vector<std::thread> clients;
-    for (int c = 0; c < options.concurrency; ++c) {
-        clients.emplace_back([&] {
-            while (true) {
-                int index = next_request.fetch_add(1);
-                if (index >= options.requests) return;
+        std::vector<std::thread> clients;
+        for (int c = 0; c < options.concurrency; ++c) {
+            clients.emplace_back([&] {
+                while (true) {
+                    int index = next_request.fetch_add(1);
+                    if (index >= options.requests) return;
 
-                const std::string& prompt =
-                    prompt_pool()[index % prompt_pool().size()];
+                    const std::string& prompt =
+                        prompt_pool()[index % prompt_pool().size()];
 
-                auto start = std::chrono::steady_clock::now();
-                GenerationResult result =
-                    engine.submit(prompt, options.max_tokens).get();
-                auto end = std::chrono::steady_clock::now();
+                    auto start = std::chrono::steady_clock::now();
+                    GenerationResult result =
+                        engine.submit(prompt, options.max_tokens).get();
+                    auto end = std::chrono::steady_clock::now();
 
-                generated_tokens.fetch_add(result.generated_tokens);
-                double ms = std::chrono::duration<double, std::milli>(end - start).count();
-                std::lock_guard<std::mutex> lock(latencies_mutex);
-                latencies_ms.push_back(ms);
-                if (options.print_output) {
-                    std::cout << "[" << index << "] " << prompt << " |"
-                              << result.text << "|\n";
+                    generated_tokens.fetch_add(result.generated_tokens);
+                    double ms = std::chrono::duration<double, std::milli>(end - start).count();
+                    std::lock_guard<std::mutex> lock(latencies_mutex);
+                    latencies_ms.push_back(ms);
+                    if (options.print_output) {
+                        std::cout << "[" << index << "] " << prompt << " |"
+                                  << result.text << "|\n";
+                    }
                 }
-            }
-        });
+            });
+        }
+        for (std::thread& client : clients) client.join();
+
+        double wall_seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - wall_start).count();
+        std::sort(latencies_ms.begin(), latencies_ms.end());
+
+        std::cout << "requests      " << options.requests << "\n"
+                  << "concurrency   " << options.concurrency << "\n"
+                  << "max_batch     " << options.max_batch << "\n"
+                  << "wall          " << wall_seconds << " s\n"
+                  << "throughput    " << options.requests / wall_seconds << " req/s\n"
+                  << "tokens/s      " << generated_tokens.load() / wall_seconds << "\n"
+                  << "latency p50   " << percentile(latencies_ms, 0.50) << " ms\n"
+                  << "latency p99   " << percentile(latencies_ms, 0.99) << " ms\n";
+    } catch (const std::exception& error) {
+        std::cerr << "bench error: " << error.what() << "\n";
+        return 1;
     }
-    for (std::thread& client : clients) client.join();
-
-    double wall_seconds =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - wall_start).count();
-    std::sort(latencies_ms.begin(), latencies_ms.end());
-
-    std::cout << "requests      " << options.requests << "\n"
-              << "concurrency   " << options.concurrency << "\n"
-              << "max_batch     " << options.max_batch << "\n"
-              << "wall          " << wall_seconds << " s\n"
-              << "throughput    " << options.requests / wall_seconds << " req/s\n"
-              << "tokens/s      " << generated_tokens.load() / wall_seconds << "\n"
-              << "latency p50   " << percentile(latencies_ms, 0.50) << " ms\n"
-              << "latency p99   " << percentile(latencies_ms, 0.99) << " ms\n";
     return 0;
 }

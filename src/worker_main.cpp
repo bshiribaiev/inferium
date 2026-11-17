@@ -1,3 +1,4 @@
+#include <exception>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -51,31 +52,36 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    ServerOptions options = parse_server_options(argc, argv);
-    if (options.threads > 0) set_num_threads(options.threads);
-    set_backend(parse_backend(options.backend));
+    try {
+        ServerOptions options = parse_server_options(argc, argv);
+        if (options.threads > 0) set_num_threads(options.threads);
+        set_backend(parse_backend(options.backend));
 
-    LoadedModel loaded(argv[1]);
+        LoadedModel loaded(argv[1]);
 
-    EngineConfig config;
-    config.max_batch = options.max_batch;
-    config.max_seq = options.max_seq;
-    InferenceEngine engine(loaded.model(), loaded.tokenizer(), config);
+        EngineConfig config;
+        config.max_batch = options.max_batch;
+        config.max_seq = options.max_seq;
+        InferenceEngine engine(loaded.model(), loaded.tokenizer(), config);
 
-    InferenceServiceImpl service(engine);
-    std::string address = options.host + ":" + std::to_string(options.port);
+        InferenceServiceImpl service(engine);
+        std::string address = options.host + ":" + std::to_string(options.port);
 
-    grpc::ServerBuilder builder;
-    builder.AddListeningPort(address, grpc::InsecureServerCredentials());
-    builder.RegisterService(&service);
+        grpc::ServerBuilder builder;
+        builder.AddListeningPort(address, grpc::InsecureServerCredentials());
+        builder.RegisterService(&service);
 
-    std::unique_ptr<grpc::Server> server = builder.BuildAndStart();
-    if (!server) {
-        std::cerr << "failed to bind " << address << "\n";
+        std::unique_ptr<grpc::Server> server = builder.BuildAndStart();
+        if (!server) {
+            std::cerr << "failed to bind " << address << "\n";
+            return 1;
+        }
+
+        std::cout << "worker listening on " << address << "\n" << std::flush;
+        server->Wait();
+    } catch (const std::exception& error) {
+        std::cerr << "worker error: " << error.what() << "\n";
         return 1;
     }
-
-    std::cout << "worker listening on " << address << "\n" << std::flush;
-    server->Wait();
     return 0;
 }

@@ -1,4 +1,5 @@
 #include <cstdlib>
+#include <exception>
 #include <iostream>
 #include <string>
 
@@ -16,18 +17,18 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    ServerOptions options = parse_server_options(argc, argv);
-    if (options.threads > 0) set_num_threads(options.threads);
-    set_backend(parse_backend(options.backend));
-
-    LoadedModel loaded(argv[1]);
-
-    EngineConfig config;
-    config.max_batch = options.max_batch;
-    config.max_seq = options.max_seq;
-    InferenceEngine engine(loaded.model(), loaded.tokenizer(), config);
-
     try {
+        ServerOptions options = parse_server_options(argc, argv);
+        if (options.threads > 0) set_num_threads(options.threads);
+        set_backend(parse_backend(options.backend));
+
+        LoadedModel loaded(argv[1]);
+
+        EngineConfig config;
+        config.max_batch = options.max_batch;
+        config.max_seq = options.max_seq;
+        InferenceEngine engine(loaded.model(), loaded.tokenizer(), config);
+
         run_http_api(options.host, options.port,
                      [&engine](const std::string& prompt, int max_tokens) {
                          return engine.submit(prompt, max_tokens).get();
