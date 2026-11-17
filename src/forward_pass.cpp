@@ -4,9 +4,7 @@
 #include <thread>
 #include <vector>
 #include <arm_neon.h>
-#include <sys/sysctl.h>
 
-#include "sme_matmul.hpp"
 #include "worker_team.hpp"
 
 std::vector<float> embed_tokens(
@@ -68,16 +66,6 @@ static void split_range_across_threads(int count, Fn process_range)
     // every thread waiting on whichever one landed on the slowest core.
     int chunk = std::max(1, count / (team.thread_count() * kChunksPerThread));
     team.run(count, chunk, process_range);
-}
-
-static bool cpu_has_sme2()
-{
-    static const bool available = [] {
-        int value = 0;
-        size_t size = sizeof(value);
-        return sysctlbyname("hw.optional.arm.FEAT_SME2", &value, &size, nullptr, 0) == 0 && value;
-    }();
-    return available;
 }
 
 static void quantize_rows(const float* X, int rows, int cols,
@@ -154,7 +142,7 @@ static void multiply_panel_int8(const int8_t* panel, const __fp16* panel_scales,
             vst1q_f32(out + (size_t)r * out_dim + first_row + 4 * q, sums[r][q]);
 }
 
-static void multiply_with_int8(const PackedMatrix& W, const float* X, float* out, int batch)
+void multiply_weights_by_batch(const PackedMatrix& W, const float* X, float* out, int batch)
 {
     thread_local std::vector<int8_t> x_values_buffer;
     thread_local std::vector<float> x_scales_buffer;
@@ -181,42 +169,6 @@ static void multiply_with_int8(const PackedMatrix& W, const float* X, float* out
             if (batch - b == 1) multiply_panel_int8<1>(panel, panel_scales, W.cols, x_rest, scales_rest, out_rest, W.rows, first_row);
         }
     });
-}
-
-static void pack_batch_into_groups(const float* X, int cols, int batch, std::vector<float>& packed)
-{
-    int n_groups = (batch + kPanelRows - 1) / kPanelRows;
-    packed.assign((size_t)n_groups * cols * kPanelRows, 0.0f);
-    for (int b = 0; b < batch; ++b) {
-        float* group = packed.data() + (size_t)(b / kPanelRows) * cols * kPanelRows;
-        const float* row = X + (size_t)b * cols;
-        for (int k = 0; k < cols; ++k)
-            group[(size_t)k * kPanelRows + b % kPanelRows] = row[k];
-    }
-}
-
-static void multiply_with_sme(const PackedMatrix& W, const float* X, float* out, int batch)
-{
-    thread_local std::vector<float> packed_batch;
-    pack_batch_into_groups(X, W.cols, batch, packed_batch);
-    const __fp16* panels = W.f16_values.data();
-    const float* batch_values = packed_batch.data();
-    split_range_across_threads(W.rows / kBlockRows, [&](int start, int end) {
-        sme_multiply_blocks(panels, W.cols, batch_values, batch, out, W.rows, start, end);
-    });
-}
-
-// Below 8 rows most of each 16x16 outer product is wasted on zero padding; the
-// microbenchmark crossover against NEON was between batch 4 and 8.
-static constexpr int kMinBatchForSme = 8;
-
-void multiply_weights_by_batch(const PackedMatrix& W, const float* X, float* out, int batch)
-{
-    if (batch >= kMinBatchForSme && cpu_has_sme2()) {
-        multiply_with_sme(W, X, out, batch);
-        return;
-    }
-    multiply_with_int8(W, X, out, batch);
 }
 
 void rope(float* x, int pos, int n_heads, int head_dim, float theta_base)

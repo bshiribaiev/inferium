@@ -20,14 +20,12 @@ add_library(inferium_core STATIC
     src/tokenizer.cpp
     src/forward_pass.cpp
     src/packed_matrix.cpp
-    src/sme_matmul.cpp
     src/worker_team.cpp
     src/engine.cpp
     src/model_loader.cpp
     src/server_options.cpp
     src/http_api.cpp)
 target_include_directories(inferium_core PUBLIC src include)
-set_source_files_properties(src/sme_matmul.cpp PROPERTIES COMPILE_OPTIONS "-march=armv8.7-a+sme2")
 target_link_libraries(inferium_core PUBLIC Threads::Threads)
 
 add_executable(inferium src/main.cpp)

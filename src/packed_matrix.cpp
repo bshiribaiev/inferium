@@ -8,26 +8,13 @@
 namespace {
 
 void validate_shape(int rows, int cols) {
-    if (rows % kBlockRows != 0) {
+    if (rows % kPanelRows != 0) {
         throw std::runtime_error("matrix with " + std::to_string(rows) +
-                                 " rows is not a multiple of " + std::to_string(kBlockRows));
+                                 " rows is not a multiple of " + std::to_string(kPanelRows));
     }
     if (cols % kQuantBlock != 0) {
         throw std::runtime_error("matrix with " + std::to_string(cols) +
                                  " columns is not a multiple of " + std::to_string(kQuantBlock));
-    }
-}
-
-void pack_f16_panels(const std::vector<float>& row_major, PackedMatrix& packed) {
-    const int cols = packed.cols;
-    packed.f16_values.resize((size_t)packed.rows * cols);
-    for (int panel = 0; panel < packed.rows / kPanelRows; ++panel) {
-        __fp16* dst = packed.f16_values.data() + (size_t)panel * cols * kPanelRows;
-        for (int r = 0; r < kPanelRows; ++r) {
-            const float* src = row_major.data() + (size_t)(panel * kPanelRows + r) * cols;
-            for (int k = 0; k < cols; ++k)
-                dst[(size_t)k * kPanelRows + r] = (__fp16)src[k];
-        }
     }
 }
 
@@ -75,7 +62,6 @@ PackedMatrix pack_into_panels(const std::vector<float>& row_major, int rows, int
     PackedMatrix packed;
     packed.rows = rows;
     packed.cols = cols;
-    pack_f16_panels(row_major, packed);
     pack_int8_panels(row_major, packed);
     return packed;
 }
