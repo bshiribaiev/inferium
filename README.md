@@ -4,9 +4,9 @@ Run LLMs on your own machine, serve them over HTTP, and spread requests across s
 nodes.
 
 It implements the whole path itself — GGUF parsing, quantized weights, the transformer
-forward pass — but the interesting part is what makes it fast: a KV-cache, NEON SIMD
-matmuls, an arena allocator, and continuous batching so concurrent requests share one pass
-over the weights. Efficiency notes covers where the time actually goes; it turned out to
+forward pass — but the interesting part is what makes it fast: a KV-cache, int8 weights
+with a NEON `sdot` matmul, a spin-then-sleep worker team, an arena allocator, and
+continuous batching so concurrent requests share one pass over the weights. Efficiency notes covers where the time actually goes; it turned out to
 be memory bandwidth rather than cores.
 
 Today that means Llama-architecture models in `Q4_K`/`Q6_K`, tested against TinyLlama-1.1B.
@@ -35,7 +35,7 @@ curl -LO https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/m
 ./build/inferium tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf "The capital of France is"
 ```
 
-You get ` Paris.` and then some rambling about ancient Rome, at ~9 tok/s on an M4.
+You get ` Paris.` and then some rambling about ancient Rome, at ~80 tok/s on an M4.
 
 Threads default to core count, override with `INFERIUM_THREADS=8`. Eight is the sweet
 spot; past that it slows down (see efficiency notes).
@@ -59,8 +59,8 @@ curl -X POST http://127.0.0.1:8080/generate \
 Fire 8 of those at once and they join a running batch, sharing one pass over the weights.
 
 One scheduler thread owns all the model compute; request threads enqueue and wait on a
-future. The matmul already fans out across the thread pool, so if requests also ran *on*
-that pool, a blocked worker could end up waiting on subtasks it was itself supposed to
+future. The matmul already fans out across the worker team, so if requests also ran *on*
+that team, a blocked worker could end up waiting on subtasks it was itself supposed to
 run. One scheduler thread sidesteps that, and keeps the weights hot in cache across
 sequences.
 
@@ -94,21 +94,34 @@ Single-stream decode, over the life of the project:
 | \+ parallel matmul | 0.42 |
 | \+ KV-cache | ~2.5 |
 | \+ NEON SIMD | 6.5 |
-| \+ arena + batched matmul | **9.2** |
+| \+ arena + batched matmul | 9.2 |
 
-About 70x, though the naive baseline had no KV-cache so it got *worse* the longer it ran.
+Then a second round, measured in one sitting (64 tokens, average of 3 runs; the machine was
+busier, so the previous stage re-measured at 16):
+
+| stage | tok/s |
+| --- | --- |
+| arena + batched matmul, re-measured | 16 |
+| \+ panel-packed weights, SME2 matmul for batches | 19 |
+| \+ `float16` weights | 33 |
+| \+ spin-then-sleep worker team | 36 |
+| \+ attention heads split across threads | 42 |
+| \+ `int8` weights with an `sdot` kernel | 74 |
+| \- SME2 (int8 for every batch size) | **84** |
+
+Thread count, int8 build: 4 → 60, 6 → 74, 8 → 81, 10 → 64 tok/s.
 
 Throughput vs batch size, 8 threads:
 
 | batch | tok/s | p50 latency |
 | --- | --- | --- |
-| 1 | 6.2 | 3.4s |
-| 4 | 14.5 | 5.7s |
-| 8 | **15.5** | 12.6s |
-| 16 | 17.1 | 22.4s |
+| 1 | 77 | 0.41s |
+| 4 | 216 | 0.58s |
+| 8 | **259** | 0.94s |
+| 16 | 265 | 1.89s |
 
-~2.5x throughput at batch 8, median of 3 runs, ±15% run to run. The latency column is the
-cost of that trade.
+3.4x throughput at batch 8, average of 2 runs, 16 requests. Peak RSS is 2.3GB.
+A ~250-token prompt prefills in 0.9s.
 
 Run it yourself:
 
@@ -122,25 +135,39 @@ Early on, 8 threads gave a 3.4x speedup. After I added the KV-cache and NEON SIM
 same 8 threads gave 1.43x. Optimizing the compute *moved the wall closer*.
 
 At batch size 1, decode reads every weight in the model from memory and uses each one for
-exactly one multiply. 1.1B params at 4 bytes is ~4.4GB per token. At ~120 GB/s that's your
-ceiling, and cores are irrelevant to it. Ten threads is actually slower than eight; the
+exactly one multiply, so bytes per token sets the ceiling and cores are irrelevant to it.
+At `float32` that was ~4.4GB per token; `float16` halved it and nearly doubled tok/s;
+`int8` with a `float16` scale per 32 weights brings it to ~1.2GB. At 84 tok/s that's
+~100 GB/s, close to the ~120 GB/s the bus can do. Ten threads is slower than eight; the
 efficiency cores add contention while bandwidth stays flat.
 
-Which tells you what batching is for: it amortizes the weight *load*. `multiply_weights_by_batch` pulls one
-weight vector into a register and fires four FMAs against four different sequences, so 8
-sequences cost roughly the memory traffic of 2. That's where the 2.5x comes from.
+The int8 kernel quantizes the activations the same way, so one `sdot` multiplies four
+weight rows by four columns in integers, and the float scales are applied once per block.
+Weights are packed in 16-row panels so each thread streams one contiguous run of memory.
 
-Gains flatten past batch 4-8 because attention is per-sequence work that batching can't
-share, and every sequence's KV cache is fighting for the same cache lines.
+Batching amortizes the weight *load*: each panel is read once and used for every sequence
+in the batch, which is why batch 8 gets ~3.4x the throughput of batch 1.
+
+SME2 (the M4's matrix unit) was faster than NEON on `float16` weights for batches of 8+,
+but it can only read float16, twice the bytes of int8. Once the weights went to int8 the
+NEON path won at every batch size, so SME was removed, which also dropped the float16
+copy and halved memory. An int8 SME kernel (`SMOPA`) is the way to bring it back.
+
+Matmuls are short (tens of microseconds), so waking threads through a mutex and condition
+variable cost a real share of each one. Workers now spin briefly on a generation counter
+and only sleep when idle, and the calling thread does a share of the work instead of
+waiting.
+
+Attention still grows with sequence length: at 256 tokens single-stream drops to ~60 tok/s.
 
 ## todos
 
-- Keep weights in `Q4_K` and dequantize per-block inside the matmul. Right now they're
-  dequantized to `float32` at load, which costs 4.8GB RSS for a 638MB file. Since the
-  bottleneck is bytes moved, this should cut memory ~4x *and* make decode faster. Highest
-  value change remaining.
-- Vectorize attention. It's still scalar and rescans the full history every step, which is
-  most of why batch gains flatten.
+- 4-bit weights with a native 4-bit kernel. Bytes per token is still the ceiling, so
+  halving them again should be the biggest remaining single-stream win. Dequantizing `Q4_K`
+  on the fly in the matmul was tried and was 27% slower; the unpacking has to be as cheap
+  as the int8 path's.
+- Vectorize attention and store the KV cache as `float16` or `int8`. It's still scalar and
+  rereads the full history every step, which is why long sequences slow down.
 - Stream tokens back as they are generated.
 - More architectures. `general.architecture` is already parsed out of the GGUF and unused,
   so that is the seam. Llama-family variants need QKV bias support and more quant formats;
@@ -152,6 +179,10 @@ share, and every sequence's KV cache is fighting for the same cache lines.
 
 **`unsupported dtype`** — only `Q4_K` (12) and `Q6_K` (14) are implemented. Most
 `Q4_K_M` files mix both, which is fine. `Q8_0`, `Q5_K` etc. will hit this.
+
+**`matrix with N rows is not a multiple of 16`** / **`columns is not a multiple of 32`** —
+weights are packed in 16-row panels and quantized in 32-column blocks. Every Llama size
+fits; an odd custom model may not.
 
 **`prompt exceeds max_seq`** — bump `--max-seq`. It's 512 by default because each slot
 preallocates its own KV cache and they add up.
