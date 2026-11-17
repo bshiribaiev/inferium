@@ -54,7 +54,7 @@ static std::vector<Symbol> initial_symbols(
 
         for (unsigned char b : ch) {
             char buf[7];
-            snprintf(buf, sizeof(buf), "<0x%02x>", (unsigned)b);
+            snprintf(buf, sizeof(buf), "<0x%02X>", (unsigned)b);
             auto bit = token_to_id.find(buf);
             syms.push_back({buf, bit != token_to_id.end() ? bit->second : 0});
         }
