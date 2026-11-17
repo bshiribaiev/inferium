@@ -8,6 +8,12 @@
 
 namespace {
 
+svfloat32_t load_panel_column(svbool_t all, const __fp16* column) __arm_streaming
+{
+    svuint32_t bits = svld1uh_u32(all, reinterpret_cast<const uint16_t*>(column));
+    return svcvt_f32_f16_x(all, svreinterpret_f16_u32(bits));
+}
+
 template <uint64_t Tile>
 void scatter_tile(float* out, int out_dim, int first_row, int group_start, int group_size)
     __arm_streaming __arm_in("za")
@@ -23,17 +29,17 @@ void scatter_tile(float* out, int out_dim, int first_row, int group_start, int g
 }
 
 __arm_new("za") __arm_locally_streaming
-void sme_multiply_blocks(const float* panels, int cols, const float* packed_batch, int batch,
+void sme_multiply_blocks(const __fp16* panels, int cols, const float* packed_batch, int batch,
                          float* out, int out_dim, int block_start, int block_end)
 {
     const svbool_t all = svptrue_b32();
     const size_t panel_floats = (size_t)cols * kPanelRows;
 
     for (int block = block_start; block < block_end; ++block) {
-        const float* w0 = panels + (size_t)(block * kPanelsPerBlock + 0) * panel_floats;
-        const float* w1 = panels + (size_t)(block * kPanelsPerBlock + 1) * panel_floats;
-        const float* w2 = panels + (size_t)(block * kPanelsPerBlock + 2) * panel_floats;
-        const float* w3 = panels + (size_t)(block * kPanelsPerBlock + 3) * panel_floats;
+        const __fp16* w0 = panels + (size_t)(block * kPanelsPerBlock + 0) * panel_floats;
+        const __fp16* w1 = panels + (size_t)(block * kPanelsPerBlock + 1) * panel_floats;
+        const __fp16* w2 = panels + (size_t)(block * kPanelsPerBlock + 2) * panel_floats;
+        const __fp16* w3 = panels + (size_t)(block * kPanelsPerBlock + 3) * panel_floats;
         const int first_row = block * kBlockRows;
 
         for (int group_start = 0; group_start < batch; group_start += kPanelRows) {
@@ -45,10 +51,10 @@ void sme_multiply_blocks(const float* panels, int cols, const float* packed_batc
             for (int k = 0; k < cols; ++k) {
                 const size_t offset = (size_t)k * kPanelRows;
                 svfloat32_t x = svld1_f32(all, x_group + offset);
-                svmopa_za32_f32_m(0, all, all, svld1_f32(all, w0 + offset), x);
-                svmopa_za32_f32_m(1, all, all, svld1_f32(all, w1 + offset), x);
-                svmopa_za32_f32_m(2, all, all, svld1_f32(all, w2 + offset), x);
-                svmopa_za32_f32_m(3, all, all, svld1_f32(all, w3 + offset), x);
+                svmopa_za32_f32_m(0, all, all, load_panel_column(all, w0 + offset), x);
+                svmopa_za32_f32_m(1, all, all, load_panel_column(all, w1 + offset), x);
+                svmopa_za32_f32_m(2, all, all, load_panel_column(all, w2 + offset), x);
+                svmopa_za32_f32_m(3, all, all, load_panel_column(all, w3 + offset), x);
             }
 
             scatter_tile<0>(out, out_dim, first_row + 0 * kPanelRows, group_start, group_size);

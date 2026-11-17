@@ -105,16 +105,18 @@ static bool cpu_has_sme2()
 }
 
 template <int kBatchRows>
-static void multiply_panel_neon(const float* panel, int cols, const float* X,
+static void multiply_panel_neon(const __fp16* panel, int cols, const float* X,
                                 float* out, int out_dim, int first_row)
 {
     float32x4_t acc[kBatchRows][4] = {};
     for (int k = 0; k < cols; ++k) {
-        const float* w = panel + (size_t)k * kPanelRows;
-        float32x4_t w0 = vld1q_f32(w);
-        float32x4_t w1 = vld1q_f32(w + 4);
-        float32x4_t w2 = vld1q_f32(w + 8);
-        float32x4_t w3 = vld1q_f32(w + 12);
+        const __fp16* w = panel + (size_t)k * kPanelRows;
+        float16x8_t low = vld1q_f16(w);
+        float16x8_t high = vld1q_f16(w + 8);
+        float32x4_t w0 = vcvt_f32_f16(vget_low_f16(low));
+        float32x4_t w1 = vcvt_high_f32_f16(low);
+        float32x4_t w2 = vcvt_f32_f16(vget_low_f16(high));
+        float32x4_t w3 = vcvt_high_f32_f16(high);
         for (int r = 0; r < kBatchRows; ++r) {
             float x = X[(size_t)r * cols + k];
             acc[r][0] = vfmaq_n_f32(acc[r][0], w0, x);
@@ -132,7 +134,7 @@ static void multiply_with_neon(const PackedMatrix& W, const float* X, float* out
 {
     split_range_across_threads(W.rows / kPanelRows, [&](int start, int end) {
         for (int p = start; p < end; ++p) {
-            const float* panel = W.panel(p);
+            const __fp16* panel = W.panel(p);
             int first_row = p * kPanelRows;
             int b = 0;
             for (; b + 4 <= batch; b += 4)
@@ -163,7 +165,7 @@ static void multiply_with_sme(const PackedMatrix& W, const float* X, float* out,
 {
     thread_local std::vector<float> packed_batch;
     pack_batch_into_groups(X, W.cols, batch, packed_batch);
-    const float* panels = W.values.data();
+    const __fp16* panels = W.values.data();
     const float* batch_values = packed_batch.data();
     split_range_across_threads(W.rows / kBlockRows, [&](int start, int end) {
         sme_multiply_blocks(panels, W.cols, batch_values, batch, out, W.rows, start, end);

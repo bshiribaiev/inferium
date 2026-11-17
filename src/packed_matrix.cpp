@@ -15,11 +15,11 @@ PackedMatrix pack_into_panels(const std::vector<float>& row_major, int rows, int
     packed.values.resize((size_t)rows * cols);
 
     for (int panel = 0; panel < rows / kPanelRows; ++panel) {
-        float* dst = packed.values.data() + (size_t)panel * cols * kPanelRows;
+        __fp16* dst = packed.values.data() + (size_t)panel * cols * kPanelRows;
         for (int r = 0; r < kPanelRows; ++r) {
             const float* src = row_major.data() + (size_t)(panel * kPanelRows + r) * cols;
             for (int k = 0; k < cols; ++k)
-                dst[(size_t)k * kPanelRows + r] = src[k];
+                dst[(size_t)k * kPanelRows + r] = (__fp16)src[k];
         }
     }
     return packed;
