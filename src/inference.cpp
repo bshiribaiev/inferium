@@ -33,9 +33,9 @@ void attention_block(const Model& m, const LayerWeights& layer, uint64_t layer_i
     float* k_dst = k_base + (size_t)past_len * cache.kv_dim;
     float* v_dst = v_base + (size_t)past_len * cache.kv_dim;
 
-    mat_mat(layer.Wq.data(), act.x_norm, act.Q, m.q_dim, m.embd_dim, n_new);
-    mat_mat(layer.Wk.data(), act.x_norm, k_dst, m.k_dim, m.embd_dim, n_new);
-    mat_mat(layer.Wv.data(), act.x_norm, v_dst, m.v_dim, m.embd_dim, n_new);
+    multiply_weights_by_batch(layer.Wq.data(), act.x_norm, act.Q, m.q_dim, m.embd_dim, n_new);
+    multiply_weights_by_batch(layer.Wk.data(), act.x_norm, k_dst, m.k_dim, m.embd_dim, n_new);
+    multiply_weights_by_batch(layer.Wv.data(), act.x_norm, v_dst, m.v_dim, m.embd_dim, n_new);
 
     for (int t = 0; t < n_new; ++t) {
         int pos = past_len + t;
@@ -70,7 +70,7 @@ int greedy_next_token(const Model& m, const float* hidden_row, Arena& arena) {
 
     std::copy(hidden_row, hidden_row + m.embd_dim, hidden);
     rms_norm(hidden, m.final_norm, m.embd_dim);
-    mat_vec(m.Wout.data(), hidden, logits, m.vocab_size, m.embd_dim);
+    multiply_weights_by_vector(m.Wout.data(), hidden, logits, m.vocab_size, m.embd_dim);
 
     return (int)(std::max_element(logits, logits + m.vocab_size) - logits);
 }
@@ -88,7 +88,7 @@ void greedy_next_tokens(const Model& m, const float* hidden_rows, int batch,
         rms_norm(dst, m.final_norm, m.embd_dim);
     }
 
-    mat_mat(m.Wout.data(), normed, logits, m.vocab_size, m.embd_dim, batch);
+    multiply_weights_by_batch(m.Wout.data(), normed, logits, m.vocab_size, m.embd_dim, batch);
 
     out.resize(batch);
     for (int b = 0; b < batch; ++b) {
@@ -120,9 +120,9 @@ void decode_batch(const Model& m, const std::vector<DecodeSlot>& slots,
             rms_norm(xn, layer.attn_norm, m.embd_dim);
         }
 
-        mat_mat(layer.Wq.data(), act.x_norm, act.Q, m.q_dim, m.embd_dim, batch);
-        mat_mat(layer.Wk.data(), act.x_norm, K_step, m.k_dim, m.embd_dim, batch);
-        mat_mat(layer.Wv.data(), act.x_norm, V_step, m.v_dim, m.embd_dim, batch);
+        multiply_weights_by_batch(layer.Wq.data(), act.x_norm, act.Q, m.q_dim, m.embd_dim, batch);
+        multiply_weights_by_batch(layer.Wk.data(), act.x_norm, K_step, m.k_dim, m.embd_dim, batch);
+        multiply_weights_by_batch(layer.Wv.data(), act.x_norm, V_step, m.v_dim, m.embd_dim, batch);
 
         for (int b = 0; b < batch; ++b) {
             KVCache& cache = *slots[b].cache;

@@ -12,9 +12,9 @@ std::vector<float> embed_tokens(
 
 void rms_norm(float* x, const float* weight, int n, float eps = 1e-5f);
 
-void mat_vec(const float* W, const float* x, float* out, int out_dim, int in_dim);
+void multiply_weights_by_vector(const float* W, const float* x, float* out, int out_dim, int in_dim);
 
-void mat_mat(const float* W, const float* X, float* out, int out_dim, int in_dim, int batch);
+void multiply_weights_by_batch(const float* W, const float* X, float* out, int out_dim, int in_dim, int batch);
 
 void rope(float* x, int pos, int n_heads, int head_dim, float theta_base = 10000.0f);
 

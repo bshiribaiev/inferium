@@ -54,7 +54,7 @@ static ThreadPool& global_pool()
 }
 
 template <typename Fn>
-static void parallel_for(int count, Fn process_range)
+static void split_range_across_threads(int count, Fn process_range)
 {
     unsigned n_threads = resolve_thread_count();
     n_threads = std::min(n_threads, (unsigned)count);
@@ -89,7 +89,7 @@ static void parallel_for(int count, Fn process_range)
     done.wait(lock, [&] { return pending == 0; });
 }
 
-static float dot(const float* a, const float* b, int n)
+static float dot_product(const float* a, const float* b, int n)
 {
     float32x4_t acc0 = vdupq_n_f32(0.0f);
     float32x4_t acc1 = vdupq_n_f32(0.0f);
@@ -113,17 +113,17 @@ static float dot(const float* a, const float* b, int n)
     return sum;
 }
 
-void mat_vec(const float* W, const float* x, float* out, int out_dim, int in_dim)
+void multiply_weights_by_vector(const float* W, const float* x, float* out, int out_dim, int in_dim)
 {
-    parallel_for(out_dim, [&](int start, int end) {
+    split_range_across_threads(out_dim, [&](int start, int end) {
         for (int i = start; i < end; ++i)
-            out[i] = dot(W + i * in_dim, x, in_dim);
+            out[i] = dot_product(W + i * in_dim, x, in_dim);
     });
 }
 
 // One weight vector load feeds four FMAs, so batched decode reads the weights
 // from memory once per four rows instead of once per row.
-static void dot_x4(const float* w, const float* x0, const float* x1,
+static void dot_product_four_rows(const float* w, const float* x0, const float* x1,
                    const float* x2, const float* x3, int n, float* out)
 {
     float32x4_t acc0 = vdupq_n_f32(0.0f);
@@ -154,16 +154,16 @@ static void dot_x4(const float* w, const float* x0, const float* x1,
     out[3] = s3;
 }
 
-void mat_mat(const float* W, const float* X, float* out,
+void multiply_weights_by_batch(const float* W, const float* X, float* out,
              int out_dim, int in_dim, int batch)
 {
-    parallel_for(out_dim, [&](int start, int end) {
+    split_range_across_threads(out_dim, [&](int start, int end) {
         float lanes[4];
         for (int i = start; i < end; ++i) {
             const float* w_row = W + (size_t)i * in_dim;
             int b = 0;
             for (; b + 4 <= batch; b += 4) {
-                dot_x4(w_row,
+                dot_product_four_rows(w_row,
                        X + (size_t)(b + 0) * in_dim, X + (size_t)(b + 1) * in_dim,
                        X + (size_t)(b + 2) * in_dim, X + (size_t)(b + 3) * in_dim,
                        in_dim, lanes);
@@ -171,7 +171,7 @@ void mat_mat(const float* W, const float* X, float* out,
                     out[(size_t)(b + k) * out_dim + i] = lanes[k];
             }
             for (; b < batch; ++b)
-                out[(size_t)b * out_dim + i] = dot(w_row, X + (size_t)b * in_dim, in_dim);
+                out[(size_t)b * out_dim + i] = dot_product(w_row, X + (size_t)b * in_dim, in_dim);
         }
     });
 }
@@ -248,7 +248,7 @@ void output_projection(
     ArenaScope scope(arena);
     float* proj = arena.alloc_floats((size_t)seq_len * embd_dim);
 
-    mat_mat(Wo, attn_out, proj, embd_dim, attn_dim, seq_len);
+    multiply_weights_by_batch(Wo, attn_out, proj, embd_dim, attn_dim, seq_len);
     for (int i = 0; i < seq_len * embd_dim; ++i)
         x[i] += proj[i];
 }
@@ -267,13 +267,13 @@ void feed_forward(
     float* up   = arena.alloc_floats((size_t)seq_len * ffn_dim);
     float* proj = arena.alloc_floats((size_t)seq_len * embd_dim);
 
-    mat_mat(Wgate, x_norm, gate, ffn_dim, embd_dim, seq_len);
-    mat_mat(Wup,   x_norm, up,   ffn_dim, embd_dim, seq_len);
+    multiply_weights_by_batch(Wgate, x_norm, gate, ffn_dim, embd_dim, seq_len);
+    multiply_weights_by_batch(Wup,   x_norm, up,   ffn_dim, embd_dim, seq_len);
 
     for (int i = 0; i < seq_len * ffn_dim; ++i)
         gate[i] = silu(gate[i]) * up[i];
 
-    mat_mat(Wdown, gate, proj, embd_dim, ffn_dim, seq_len);
+    multiply_weights_by_batch(Wdown, gate, proj, embd_dim, ffn_dim, seq_len);
     for (int i = 0; i < seq_len * embd_dim; ++i)
         x[i] += proj[i];
 }

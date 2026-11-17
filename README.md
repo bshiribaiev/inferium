@@ -126,7 +126,7 @@ exactly one multiply. 1.1B params at 4 bytes is ~4.4GB per token. At ~120 GB/s t
 ceiling, and cores are irrelevant to it. Ten threads is actually slower than eight; the
 efficiency cores add contention while bandwidth stays flat.
 
-Which tells you what batching is for: it amortizes the weight *load*. `mat_mat` pulls one
+Which tells you what batching is for: it amortizes the weight *load*. `multiply_weights_by_batch` pulls one
 weight vector into a register and fires four FMAs against four different sequences, so 8
 sequences cost roughly the memory traffic of 2. That's where the 2.5x comes from.
 
