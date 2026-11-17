@@ -33,9 +33,9 @@ void attention_block(const Model& m, const LayerWeights& layer, uint64_t layer_i
     float* k_dst = k_base + (size_t)past_len * cache.kv_dim;
     float* v_dst = v_base + (size_t)past_len * cache.kv_dim;
 
-    multiply_weights_by_batch(layer.Wq.data(), act.x_norm, act.Q, m.q_dim, m.embd_dim, n_new);
-    multiply_weights_by_batch(layer.Wk.data(), act.x_norm, k_dst, m.k_dim, m.embd_dim, n_new);
-    multiply_weights_by_batch(layer.Wv.data(), act.x_norm, v_dst, m.v_dim, m.embd_dim, n_new);
+    multiply_weights_by_batch(layer.Wq, act.x_norm, act.Q, n_new);
+    multiply_weights_by_batch(layer.Wk, act.x_norm, k_dst, n_new);
+    multiply_weights_by_batch(layer.Wv, act.x_norm, v_dst, n_new);
 
     for (int t = 0; t < n_new; ++t) {
         int pos = past_len + t;
@@ -45,8 +45,7 @@ void attention_block(const Model& m, const LayerWeights& layer, uint64_t layer_i
 
     attention(act.Q, k_base, v_base, act.attn_out,
               n_new, past_len, m.n_heads, m.n_kv_heads, m.head_dim);
-    output_projection(act.attn_out, layer.Wo.data(), input,
-                      n_new, m.q_dim, m.embd_dim, arena);
+    output_projection(act.attn_out, layer.Wo, input, n_new, m.embd_dim, arena);
 }
 
 void ffn_block(const Model& m, const LayerWeights& layer,
@@ -57,7 +56,7 @@ void ffn_block(const Model& m, const LayerWeights& layer,
         std::copy(x, x + m.embd_dim, xn);
         rms_norm(xn, layer.ffn_norm, m.embd_dim);
     }
-    feed_forward(act.x_norm, layer.Wgate.data(), layer.Wup.data(), layer.Wdown.data(),
+    feed_forward(act.x_norm, layer.Wgate, layer.Wup, layer.Wdown,
                  input, n_new, m.embd_dim, m.ffn_dim, arena);
 }
 
@@ -70,7 +69,7 @@ int greedy_next_token(const Model& m, const float* hidden_row, Arena& arena) {
 
     std::copy(hidden_row, hidden_row + m.embd_dim, hidden);
     rms_norm(hidden, m.final_norm, m.embd_dim);
-    multiply_weights_by_vector(m.Wout.data(), hidden, logits, m.vocab_size, m.embd_dim);
+    multiply_weights_by_batch(m.Wout, hidden, logits, 1);
 
     return (int)(std::max_element(logits, logits + m.vocab_size) - logits);
 }
@@ -88,7 +87,7 @@ void greedy_next_tokens(const Model& m, const float* hidden_rows, int batch,
         rms_norm(dst, m.final_norm, m.embd_dim);
     }
 
-    multiply_weights_by_batch(m.Wout.data(), normed, logits, m.vocab_size, m.embd_dim, batch);
+    multiply_weights_by_batch(m.Wout, normed, logits, batch);
 
     out.resize(batch);
     for (int b = 0; b < batch; ++b) {
@@ -120,9 +119,9 @@ void decode_batch(const Model& m, const std::vector<DecodeSlot>& slots,
             rms_norm(xn, layer.attn_norm, m.embd_dim);
         }
 
-        multiply_weights_by_batch(layer.Wq.data(), act.x_norm, act.Q, m.q_dim, m.embd_dim, batch);
-        multiply_weights_by_batch(layer.Wk.data(), act.x_norm, K_step, m.k_dim, m.embd_dim, batch);
-        multiply_weights_by_batch(layer.Wv.data(), act.x_norm, V_step, m.v_dim, m.embd_dim, batch);
+        multiply_weights_by_batch(layer.Wq, act.x_norm, act.Q, batch);
+        multiply_weights_by_batch(layer.Wk, act.x_norm, K_step, batch);
+        multiply_weights_by_batch(layer.Wv, act.x_norm, V_step, batch);
 
         for (int b = 0; b < batch; ++b) {
             KVCache& cache = *slots[b].cache;
@@ -146,8 +145,7 @@ void decode_batch(const Model& m, const std::vector<DecodeSlot>& slots,
                       1, slots[b].pos, m.n_heads, m.n_kv_heads, m.head_dim);
         }
 
-        output_projection(act.attn_out, layer.Wo.data(), input,
-                          batch, m.q_dim, m.embd_dim, arena);
+        output_projection(act.attn_out, layer.Wo, input, batch, m.embd_dim, arena);
 
         for (int b = 0; b < batch; ++b) {
             const float* x = input + (size_t)b * m.embd_dim;
@@ -155,7 +153,7 @@ void decode_batch(const Model& m, const std::vector<DecodeSlot>& slots,
             std::copy(x, x + m.embd_dim, xn);
             rms_norm(xn, layer.ffn_norm, m.embd_dim);
         }
-        feed_forward(act.x_norm, layer.Wgate.data(), layer.Wup.data(), layer.Wdown.data(),
+        feed_forward(act.x_norm, layer.Wgate, layer.Wup, layer.Wdown,
                      input, batch, m.embd_dim, m.ffn_dim, arena);
     }
 

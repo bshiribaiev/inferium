@@ -3,12 +3,13 @@
 #include <vector>
 
 #include "gguf_parser.hpp"
+#include "packed_matrix.hpp"
 
 struct LayerWeights {
     const float* attn_norm;
     const float* ffn_norm;
-    std::vector<float> Wq, Wk, Wv, Wo;
-    std::vector<float> Wgate, Wup, Wdown;
+    PackedMatrix Wq, Wk, Wv, Wo;
+    PackedMatrix Wgate, Wup, Wdown;
 };
 
 struct Model {
@@ -20,7 +21,7 @@ struct Model {
     std::vector<float> embd_table;
     std::vector<LayerWeights> layers;
     const float* final_norm;
-    std::vector<float> Wout;
+    PackedMatrix Wout;
 };
 
 Model load_model(const GgufParser& parser, const uint8_t* base);

@@ -23,19 +23,26 @@ std::vector<float> dequant_tensor(const GgufParser& parser, const uint8_t* tenso
     return out;
 }
 
+PackedMatrix packed_tensor(const GgufParser& parser, const uint8_t* tensor_data,
+                           const std::string& name) {
+    const TensorInfo& t = parser.tensors.at(name);
+    return pack_into_panels(dequant_tensor(parser, tensor_data, name),
+                            (int)t.dims[1], (int)t.dims[0]);
+}
+
 LayerWeights load_layer_weights(const GgufParser& parser, const uint8_t* tensor_data,
                                 uint64_t layer_index) {
     std::string prefix = "blk." + std::to_string(layer_index) + ".";
     LayerWeights layer;
     layer.attn_norm = norm_tensor(parser, tensor_data, prefix + "attn_norm.weight");
     layer.ffn_norm  = norm_tensor(parser, tensor_data, prefix + "ffn_norm.weight");
-    layer.Wq    = dequant_tensor(parser, tensor_data, prefix + "attn_q.weight");
-    layer.Wk    = dequant_tensor(parser, tensor_data, prefix + "attn_k.weight");
-    layer.Wv    = dequant_tensor(parser, tensor_data, prefix + "attn_v.weight");
-    layer.Wo    = dequant_tensor(parser, tensor_data, prefix + "attn_output.weight");
-    layer.Wgate = dequant_tensor(parser, tensor_data, prefix + "ffn_gate.weight");
-    layer.Wup   = dequant_tensor(parser, tensor_data, prefix + "ffn_up.weight");
-    layer.Wdown = dequant_tensor(parser, tensor_data, prefix + "ffn_down.weight");
+    layer.Wq    = packed_tensor(parser, tensor_data, prefix + "attn_q.weight");
+    layer.Wk    = packed_tensor(parser, tensor_data, prefix + "attn_k.weight");
+    layer.Wv    = packed_tensor(parser, tensor_data, prefix + "attn_v.weight");
+    layer.Wo    = packed_tensor(parser, tensor_data, prefix + "attn_output.weight");
+    layer.Wgate = packed_tensor(parser, tensor_data, prefix + "ffn_gate.weight");
+    layer.Wup   = packed_tensor(parser, tensor_data, prefix + "ffn_up.weight");
+    layer.Wdown = packed_tensor(parser, tensor_data, prefix + "ffn_down.weight");
     return layer;
 }
 
@@ -62,7 +69,7 @@ Model load_model(const GgufParser& parser, const uint8_t* base) {
 
     m.embd_table = dequant_tensor(parser, tensor_data, "token_embd.weight");
     m.final_norm = norm_tensor(parser, tensor_data, "output_norm.weight");
-    m.Wout       = dequant_tensor(parser, tensor_data, "output.weight");
+    m.Wout       = packed_tensor(parser, tensor_data, "output.weight");
 
     m.layers.resize(m.n_layers);
     for (uint64_t l = 0; l < m.n_layers; ++l) {

@@ -7,7 +7,9 @@
 #include <thread>
 #include <vector>
 #include <arm_neon.h>
+#include <sys/sysctl.h>
 
+#include "sme_matmul.hpp"
 #include "thread_pool.hpp"
 
 std::vector<float> embed_tokens(
@@ -92,91 +94,93 @@ static void split_range_across_threads(int count, Fn process_range)
     done.wait(lock, [&] { return pending == 0; });
 }
 
-static float dot_product(const float* a, const float* b, int n)
+static bool cpu_has_sme2()
 {
-    float32x4_t acc0 = vdupq_n_f32(0.0f);
-    float32x4_t acc1 = vdupq_n_f32(0.0f);
-    float32x4_t acc2 = vdupq_n_f32(0.0f);
-    float32x4_t acc3 = vdupq_n_f32(0.0f);
-
-    int j = 0;
-    for (; j + 16 <= n; j += 16) {
-        acc0 = vfmaq_f32(acc0, vld1q_f32(a + j),      vld1q_f32(b + j));
-        acc1 = vfmaq_f32(acc1, vld1q_f32(a + j + 4),  vld1q_f32(b + j + 4));
-        acc2 = vfmaq_f32(acc2, vld1q_f32(a + j + 8),  vld1q_f32(b + j + 8));
-        acc3 = vfmaq_f32(acc3, vld1q_f32(a + j + 12), vld1q_f32(b + j + 12));
-    }
-    for (; j + 4 <= n; j += 4)
-        acc0 = vfmaq_f32(acc0, vld1q_f32(a + j), vld1q_f32(b + j));
-
-    float sum = vaddvq_f32(acc0) + vaddvq_f32(acc1)
-              + vaddvq_f32(acc2) + vaddvq_f32(acc3);
-    for (; j < n; ++j)
-        sum += a[j] * b[j];
-    return sum;
+    static const bool available = [] {
+        int value = 0;
+        size_t size = sizeof(value);
+        return sysctlbyname("hw.optional.arm.FEAT_SME2", &value, &size, nullptr, 0) == 0 && value;
+    }();
+    return available;
 }
 
-void multiply_weights_by_vector(const float* W, const float* x, float* out, int out_dim, int in_dim)
+template <int kBatchRows>
+static void multiply_panel_neon(const float* panel, int cols, const float* X,
+                                float* out, int out_dim, int first_row)
 {
-    split_range_across_threads(out_dim, [&](int start, int end) {
-        for (int i = start; i < end; ++i)
-            out[i] = dot_product(W + i * in_dim, x, in_dim);
-    });
+    float32x4_t acc[kBatchRows][4] = {};
+    for (int k = 0; k < cols; ++k) {
+        const float* w = panel + (size_t)k * kPanelRows;
+        float32x4_t w0 = vld1q_f32(w);
+        float32x4_t w1 = vld1q_f32(w + 4);
+        float32x4_t w2 = vld1q_f32(w + 8);
+        float32x4_t w3 = vld1q_f32(w + 12);
+        for (int r = 0; r < kBatchRows; ++r) {
+            float x = X[(size_t)r * cols + k];
+            acc[r][0] = vfmaq_n_f32(acc[r][0], w0, x);
+            acc[r][1] = vfmaq_n_f32(acc[r][1], w1, x);
+            acc[r][2] = vfmaq_n_f32(acc[r][2], w2, x);
+            acc[r][3] = vfmaq_n_f32(acc[r][3], w3, x);
+        }
+    }
+    for (int r = 0; r < kBatchRows; ++r)
+        for (int q = 0; q < 4; ++q)
+            vst1q_f32(out + (size_t)r * out_dim + first_row + 4 * q, acc[r][q]);
 }
 
-// One weight vector load feeds four FMAs, so batched decode reads the weights
-// from memory once per four rows instead of once per row.
-static void dot_product_four_rows(const float* w, const float* x0, const float* x1,
-                   const float* x2, const float* x3, int n, float* out)
+static void multiply_with_neon(const PackedMatrix& W, const float* X, float* out, int batch)
 {
-    float32x4_t acc0 = vdupq_n_f32(0.0f);
-    float32x4_t acc1 = vdupq_n_f32(0.0f);
-    float32x4_t acc2 = vdupq_n_f32(0.0f);
-    float32x4_t acc3 = vdupq_n_f32(0.0f);
-
-    int j = 0;
-    for (; j + 4 <= n; j += 4) {
-        float32x4_t wv = vld1q_f32(w + j);
-        acc0 = vfmaq_f32(acc0, wv, vld1q_f32(x0 + j));
-        acc1 = vfmaq_f32(acc1, wv, vld1q_f32(x1 + j));
-        acc2 = vfmaq_f32(acc2, wv, vld1q_f32(x2 + j));
-        acc3 = vfmaq_f32(acc3, wv, vld1q_f32(x3 + j));
-    }
-
-    float s0 = vaddvq_f32(acc0), s1 = vaddvq_f32(acc1);
-    float s2 = vaddvq_f32(acc2), s3 = vaddvq_f32(acc3);
-    for (; j < n; ++j) {
-        s0 += w[j] * x0[j];
-        s1 += w[j] * x1[j];
-        s2 += w[j] * x2[j];
-        s3 += w[j] * x3[j];
-    }
-    out[0] = s0;
-    out[1] = s1;
-    out[2] = s2;
-    out[3] = s3;
-}
-
-void multiply_weights_by_batch(const float* W, const float* X, float* out,
-             int out_dim, int in_dim, int batch)
-{
-    split_range_across_threads(out_dim, [&](int start, int end) {
-        float lanes[4];
-        for (int i = start; i < end; ++i) {
-            const float* w_row = W + (size_t)i * in_dim;
+    split_range_across_threads(W.rows / kPanelRows, [&](int start, int end) {
+        for (int p = start; p < end; ++p) {
+            const float* panel = W.panel(p);
+            int first_row = p * kPanelRows;
             int b = 0;
-            for (; b + 4 <= batch; b += 4) {
-                dot_product_four_rows(w_row,
-                       X + (size_t)(b + 0) * in_dim, X + (size_t)(b + 1) * in_dim,
-                       X + (size_t)(b + 2) * in_dim, X + (size_t)(b + 3) * in_dim,
-                       in_dim, lanes);
-                for (int k = 0; k < 4; ++k)
-                    out[(size_t)(b + k) * out_dim + i] = lanes[k];
-            }
-            for (; b < batch; ++b)
-                out[(size_t)b * out_dim + i] = dot_product(w_row, X + (size_t)b * in_dim, in_dim);
+            for (; b + 4 <= batch; b += 4)
+                multiply_panel_neon<4>(panel, W.cols, X + (size_t)b * W.cols,
+                                       out + (size_t)b * W.rows, W.rows, first_row);
+            const float* x_rest = X + (size_t)b * W.cols;
+            float* out_rest = out + (size_t)b * W.rows;
+            if (batch - b == 3) multiply_panel_neon<3>(panel, W.cols, x_rest, out_rest, W.rows, first_row);
+            if (batch - b == 2) multiply_panel_neon<2>(panel, W.cols, x_rest, out_rest, W.rows, first_row);
+            if (batch - b == 1) multiply_panel_neon<1>(panel, W.cols, x_rest, out_rest, W.rows, first_row);
         }
     });
+}
+
+static void pack_batch_into_groups(const float* X, int cols, int batch, std::vector<float>& packed)
+{
+    int n_groups = (batch + kPanelRows - 1) / kPanelRows;
+    packed.assign((size_t)n_groups * cols * kPanelRows, 0.0f);
+    for (int b = 0; b < batch; ++b) {
+        float* group = packed.data() + (size_t)(b / kPanelRows) * cols * kPanelRows;
+        const float* row = X + (size_t)b * cols;
+        for (int k = 0; k < cols; ++k)
+            group[(size_t)k * kPanelRows + b % kPanelRows] = row[k];
+    }
+}
+
+static void multiply_with_sme(const PackedMatrix& W, const float* X, float* out, int batch)
+{
+    thread_local std::vector<float> packed_batch;
+    pack_batch_into_groups(X, W.cols, batch, packed_batch);
+    const float* panels = W.values.data();
+    const float* batch_values = packed_batch.data();
+    split_range_across_threads(W.rows / kBlockRows, [&](int start, int end) {
+        sme_multiply_blocks(panels, W.cols, batch_values, batch, out, W.rows, start, end);
+    });
+}
+
+// Below 8 rows most of each 16x16 outer product is wasted on zero padding; the
+// microbenchmark crossover against NEON was between batch 4 and 8.
+static constexpr int kMinBatchForSme = 8;
+
+void multiply_weights_by_batch(const PackedMatrix& W, const float* X, float* out, int batch)
+{
+    if (batch >= kMinBatchForSme && cpu_has_sme2()) {
+        multiply_with_sme(W, X, out, batch);
+        return;
+    }
+    multiply_with_neon(W, X, out, batch);
 }
 
 void rope(float* x, int pos, int n_heads, int head_dim, float theta_base)
@@ -245,13 +249,13 @@ void attention(
 }
 
 void output_projection(
-    const float* attn_out, const float* Wo, float* x,
-    int seq_len, int attn_dim, int embd_dim, Arena& arena)
+    const float* attn_out, const PackedMatrix& Wo, float* x,
+    int seq_len, int embd_dim, Arena& arena)
 {
     ArenaScope scope(arena);
     float* proj = arena.alloc_floats((size_t)seq_len * embd_dim);
 
-    multiply_weights_by_batch(Wo, attn_out, proj, embd_dim, attn_dim, seq_len);
+    multiply_weights_by_batch(Wo, attn_out, proj, seq_len);
     for (int i = 0; i < seq_len * embd_dim; ++i)
         x[i] += proj[i];
 }
@@ -262,7 +266,8 @@ static float silu(float x)
 }
 
 void feed_forward(
-    const float* x_norm, const float* Wgate, const float* Wup, const float* Wdown,
+    const float* x_norm, const PackedMatrix& Wgate, const PackedMatrix& Wup,
+    const PackedMatrix& Wdown,
     float* x, int seq_len, int embd_dim, int ffn_dim, Arena& arena)
 {
     ArenaScope scope(arena);
@@ -270,13 +275,13 @@ void feed_forward(
     float* up   = arena.alloc_floats((size_t)seq_len * ffn_dim);
     float* proj = arena.alloc_floats((size_t)seq_len * embd_dim);
 
-    multiply_weights_by_batch(Wgate, x_norm, gate, ffn_dim, embd_dim, seq_len);
-    multiply_weights_by_batch(Wup,   x_norm, up,   ffn_dim, embd_dim, seq_len);
+    multiply_weights_by_batch(Wgate, x_norm, gate, seq_len);
+    multiply_weights_by_batch(Wup,   x_norm, up,   seq_len);
 
     for (int i = 0; i < seq_len * ffn_dim; ++i)
         gate[i] = silu(gate[i]) * up[i];
 
-    multiply_weights_by_batch(Wdown, gate, proj, embd_dim, ffn_dim, seq_len);
+    multiply_weights_by_batch(Wdown, gate, proj, seq_len);
     for (int i = 0; i < seq_len * embd_dim; ++i)
         x[i] += proj[i];
 }
